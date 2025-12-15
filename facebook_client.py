@@ -274,6 +274,9 @@ class FacebookAdsClient:
         level: str = "account",
         breakdowns: Optional[List[str]] = None,
         time_increment: Optional[str] = None,
+        campaign_ids: Optional[List[str]] = None,
+        adset_ids: Optional[List[str]] = None,
+        ad_ids: Optional[List[str]] = None,
         limit: int = 100
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
@@ -289,6 +292,9 @@ class FacebookAdsClient:
             level: Aggregation level ('account', 'campaign', 'adset', or 'ad')
             breakdowns: Optional breakdowns (e.g., ['age', 'gender'])
             time_increment: Time granularity ('1' for daily, 'all_days' for total)
+            campaign_ids: Optional list of campaign IDs to filter by
+            adset_ids: Optional list of ad set IDs to filter by
+            ad_ids: Optional list of ad IDs to filter by
             limit: Results per page for internal batching (default: 100)
 
         Returns:
@@ -301,7 +307,8 @@ class FacebookAdsClient:
             ...     start_date='2025-01-01',
             ...     end_date='2025-01-31',
             ...     fields=['campaign_name', 'spend', 'impressions', 'clicks'],
-            ...     level='campaign'
+            ...     level='campaign',
+            ...     campaign_ids=['123', '456']  # Filter by specific campaigns
             ... )
             >>> print(f"Retrieved {len(insights['data'])} insights rows")
         """
@@ -320,6 +327,30 @@ class FacebookAdsClient:
 
         if time_increment:
             params['time_increment'] = time_increment
+
+        # Build filtering parameter for campaign/adset/ad IDs
+        filtering = []
+        if campaign_ids:
+            filtering.append({
+                'field': 'campaign.id',
+                'operator': 'IN',
+                'value': campaign_ids
+            })
+        if adset_ids:
+            filtering.append({
+                'field': 'adset.id',
+                'operator': 'IN',
+                'value': adset_ids
+            })
+        if ad_ids:
+            filtering.append({
+                'field': 'ad.id',
+                'operator': 'IN',
+                'value': ad_ids
+            })
+        
+        if filtering:
+            params['filtering'] = json.dumps(filtering)
 
         return self._make_paginated_request(
             f"/{account_id}/insights",

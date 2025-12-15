@@ -35,23 +35,38 @@ def list_ad_accounts() -> List[dict]:
 
     Returns complete list of all accounts automatically - no pagination needed.
     This tool handles pagination internally and returns ALL accounts in a single call.
+    
+    **THIS IS THE FIRST TOOL TO CALL** when working with Facebook Ads.
+    Use it to find the account_id needed for all other tools.
 
     Returns:
         List of ad account dictionaries with keys:
-        - id: Account ID with 'act_' prefix (e.g., "act_123456")
-        - account_id: Numeric account ID
-        - name: Account name
-        - currency: Account currency code (e.g., "USD")
+        - id: Account ID with 'act_' prefix (e.g., "act_123456789")
+              **USE THIS** for account_id parameter in other tools
+        - account_id: Numeric account ID (without prefix)
+        - name: Account name (use to identify the right account)
+        - currency: Account currency code (e.g., "USD", "CHF", "EUR")
         - timezone_name: Account timezone
         - account_status: 1 = Active, 101 = Disabled
-        - business: Business object (if linked)
+        - business: Business object with id and name (if linked)
 
-    Example:
-        List all accessible ad accounts and display their names and IDs.
+    Examples:
+        **1. Find account by name:**
+        accounts = list_ad_accounts()
+        # Look for account named "My Company" in the results
+        # Use the 'id' field (e.g., "act_123456789") for other tools
+        
+        **2. Typical workflow:**
+        # Step 1: List accounts to find account_id
+        accounts = list_ad_accounts()
+        
+        # Step 2: Use account_id in other tools
+        # campaigns = list_campaigns(account_id="act_123456789")
+        # insights = get_account_insights(account_id="act_123456789", ...)
     
     Note:
-        This tool automatically fetches ALL pages of results. You will receive
-        the complete list of all accounts in one response - no manual pagination needed.
+        - Pagination is handled automatically - you get ALL accounts
+        - Look for account_status=1 for active accounts
     """
     client = _get_client()
     response = client.get_ad_accounts()
@@ -68,25 +83,54 @@ def list_campaigns(
 
     Automatically fetches all pages of results and returns complete list.
     No manual pagination required.
+    
+    **USE THIS TOOL TO GET CAMPAIGN IDs FOR FILTERING:**
+    When user wants insights for specific campaigns (e.g., "all French campaigns"):
+    1. Call this tool to get all campaigns
+    2. Filter results by campaign name pattern (e.g., names containing "FR")
+    3. Extract the 'id' field from matching campaigns
+    4. Pass those IDs to get_account_insights(campaign_ids=[...])
 
     Args:
         account_id: Ad account ID (with or without 'act_' prefix)
-        status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all
+            Example: "act_123456789" or "123456789"
+        status_filter: Filter by status (optional):
+            - 'ACTIVE': Only active campaigns
+            - 'PAUSED': Only paused campaigns
+            - 'ARCHIVED': Only archived campaigns
+            - None: All campaigns (default)
 
     Returns:
-        Complete list of all campaigns with keys:
-        - id: Campaign ID
-        - name: Campaign name
-        - status: Campaign status
-        - effective_status: Effective status (considers parent statuses)
-        - objective: Campaign objective (e.g., "CONVERSIONS", "LINK_CLICKS")
-        - daily_budget: Daily budget in cents
+        List of campaign dictionaries with these keys:
+        - id: Campaign ID (USE THIS for filtering in get_account_insights)
+        - name: Campaign name (USE THIS for pattern matching)
+        - status: Campaign status (ACTIVE, PAUSED, etc.)
+        - effective_status: Effective status
+        - objective: Campaign objective
+        - daily_budget: Daily budget in cents (divide by 100 for currency)
         - lifetime_budget: Lifetime budget in cents
         - created_time: Creation timestamp
         - updated_time: Last update timestamp
 
-    Example:
-        Get all active campaigns for account "123456".
+    Examples:
+        **1. Get all active campaigns:**
+        list_campaigns(account_id="act_123456789", status_filter="ACTIVE")
+        
+        **2. Get all campaigns (any status):**
+        list_campaigns(account_id="act_123456789")
+        
+        **3. Workflow to filter campaigns by name pattern:**
+        # Step 1: Get all campaigns
+        campaigns = list_campaigns(account_id="act_123456789")
+        
+        # Step 2: Filter by name (e.g., campaigns containing "CH | FR")
+        # fr_campaigns = [c for c in campaigns if "CH | FR" in c["name"]]
+        
+        # Step 3: Extract IDs
+        # fr_campaign_ids = [c["id"] for c in fr_campaigns]
+        
+        # Step 4: Get insights for those campaigns only
+        # get_account_insights(..., campaign_ids=fr_campaign_ids)
     """
     client = _get_client()
     effective_status = [status_filter] if status_filter else None
@@ -171,6 +215,9 @@ def get_account_insights(
     level: str = "account",
     breakdowns: Optional[List[str]] = None,
     time_increment: Optional[str] = None,
+    campaign_ids: Optional[List[str]] = None,
+    adset_ids: Optional[List[str]] = None,
+    ad_ids: Optional[List[str]] = None,
     flatten_actions: bool = True
 ) -> List[dict]:
     """
@@ -178,68 +225,154 @@ def get_account_insights(
 
     Automatically fetches all pages of insights data and returns complete results.
     This is the primary tool for retrieving performance metrics.
+    
+    **WORKFLOW FOR FILTERING BY CAMPAIGN NAME:**
+    If user wants data for campaigns matching a pattern (e.g., "CH | FR" campaigns):
+    1. First call list_campaigns(account_id) to get all campaigns with their IDs
+    2. Filter the results to find campaigns whose names match the pattern
+    3. Extract the campaign IDs from matching campaigns
+    4. Call get_account_insights with campaign_ids parameter set to those IDs
+    
+    **CALCULATING CTR AND CPC:**
+    The API returns ctr and cpc based on link clicks, which may differ from UI.
+    To match Facebook UI exactly, calculate manually:
+    - CTR = (inline_link_clicks / impressions) * 100
+    - CPC = spend / inline_link_clicks
 
     Args:
         account_id: Ad account ID (with or without 'act_' prefix)
+            Example: "act_123456789" or just "123456789"
         start_date: Start date in YYYY-MM-DD format
+            Example: "2025-01-01"
         end_date: End date in YYYY-MM-DD format
-        fields: List of metrics to retrieve
-            Common fields: 'spend', 'impressions', 'clicks', 'ctr', 'cpc', 'cpm',
-                          'reach', 'frequency', 'actions', 'action_values',
-                          'conversions', 'conversion_values',
-                          'campaign_name', 'campaign_id', 'adset_name', 'adset_id'
+            Example: "2025-01-31"
+        fields: List of metrics to retrieve. ALWAYS include the fields you need!
             
-            Important: 'conversions' field includes Facebook Conversions API events:
-                - conversion_schedule_total: Appointment scheduling events
-                - conversion_find_location_total: Find location events
-                - Other custom conversion events
-            These may differ from 'actions' due to different attribution models.
-        level: Aggregation level - one of:
-            - 'account': Account-level aggregation
-            - 'campaign': Broken down by campaign
-            - 'adset': Broken down by ad set
-            - 'ad': Broken down by individual ad
-        breakdowns: Optional breakdowns for segmentation:
-            Demographics: 'age', 'gender'
-            Geography: 'country', 'region', 'dma'
-            Platform: 'publisher_platform', 'platform_position', 'device_platform'
-        time_increment: Time granularity:
-            - '1': Daily breakdown
+            **BASIC METRICS (most common):**
+            - 'spend': Total cost/spend
+            - 'impressions': Number of times ads were shown
+            - 'reach': Unique people who saw ads
+            - 'inline_link_clicks': Link clicks (use this for CTR/CPC calculations)
+            - 'clicks': All clicks (includes likes, comments, shares)
+            
+            **CALCULATED METRICS (returned by API but may differ from UI):**
+            - 'ctr': Click-through rate
+            - 'cpc': Cost per click
+            - 'cpm': Cost per 1000 impressions
+            
+            **CAMPAIGN/ADSET/AD INFO (include when level != 'account'):**
+            - 'campaign_name', 'campaign_id': Campaign details
+            - 'adset_name', 'adset_id': Ad set details
+            - 'ad_name', 'ad_id': Ad details
+            
+            **CONVERSION METRICS:**
+            - 'actions': Standard pixel events (purchases, leads, etc.)
+              Returns flattened as: action_purchase, action_lead, etc.
+            - 'action_values': Monetary values of actions
+              Returns flattened as: action_value_purchase, etc.
+            - 'conversions': Facebook Conversions API events
+              Returns: conversion_schedule_total (appointments), 
+                       conversion_find_location_total, etc.
+            - 'purchase_roas': Return on ad spend for purchases
+            
+        level: Aggregation level - MUST match what you're querying:
+            - 'account': Total account performance (no breakdown)
+            - 'campaign': Broken down by campaign (include campaign_name in fields)
+            - 'adset': Broken down by ad set (include adset_name in fields)
+            - 'ad': Broken down by individual ad (include ad_name in fields)
+            
+        breakdowns: Optional list for demographic/platform segmentation:
+            - ['age']: By age group
+            - ['gender']: By gender
+            - ['age', 'gender']: By age AND gender
+            - ['country']: By country
+            - ['publisher_platform']: By platform (Facebook, Instagram, etc.)
+            
+        time_increment: Time granularity for the data:
+            - '1': Daily breakdown (one row per day)
             - '7': Weekly breakdown
             - 'monthly': Monthly breakdown
-            - 'all_days': Total aggregation (default)
-        flatten_actions: If True, flatten 'actions' array into separate fields
-            (e.g., action_purchase, action_lead). Default: True
+            - 'all_days' or None: Total aggregation (single row, DEFAULT)
+            
+        campaign_ids: Optional list of campaign IDs to filter results.
+            **HOW TO USE:** 
+            1. Call list_campaigns() first to get campaign IDs
+            2. Filter campaigns by name pattern you need
+            3. Pass matching IDs here as a list: ["id1", "id2", "id3"]
+            This filters at API level - much more efficient than client-side filtering!
+            
+        adset_ids: Optional list of ad set IDs to filter results.
+            Same workflow as campaign_ids but for ad sets.
+            
+        ad_ids: Optional list of ad IDs to filter results.
+            Same workflow as campaign_ids but for ads.
+            
+        flatten_actions: If True (default), flattens nested action arrays.
+            - True: Returns action_purchase, action_lead as separate fields
+            - False: Returns raw actions array (rarely needed)
 
     Returns:
-        Complete list of all insights rows with flattened structure.
-        If flatten_actions=True, actions like [{'action_type': 'purchase', 'value': '5'}]
-        become flat fields: {'action_purchase': '5'}
+        List of dictionaries, each containing the requested metrics.
+        
+        **EXAMPLE RESPONSE (level='campaign', time_increment='1'):**
+        [
+            {
+                "campaign_name": "Summer Sale 2025",
+                "spend": 150.50,
+                "impressions": 25000,
+                "inline_link_clicks": 450,
+                "action_purchase": 12,
+                "date_start": "2025-01-01"
+            },
+            ...
+        ]
 
     Examples:
-        # Get account-level performance with standard actions
+        **1. Get total account performance for a date range:**
         get_account_insights(
-            account_id="123456",
+            account_id="act_123456789",
             start_date="2025-01-01",
             end_date="2025-01-31",
-            fields=["spend", "impressions", "clicks", "actions"],
+            fields=["spend", "impressions", "reach", "inline_link_clicks"],
             level="account"
         )
         
-        # Get campaign performance with conversions (for appointment scheduling, etc.)
+        **2. Get daily campaign breakdown:**
         get_account_insights(
-            account_id="123456",
-            start_date="2025-11-24",
-            end_date="2025-12-10",
-            fields=["campaign_name", "spend", "impressions", "actions", "conversions"],
-            level="campaign"
+            account_id="act_123456789",
+            start_date="2025-01-01",
+            end_date="2025-01-07",
+            fields=["campaign_name", "spend", "impressions", "inline_link_clicks"],
+            level="campaign",
+            time_increment="1"
         )
-        # Returns: conversion_schedule_total, conversion_find_location_total, etc.
+        
+        **3. Get data for SPECIFIC campaigns only (by ID):**
+        get_account_insights(
+            account_id="act_123456789",
+            start_date="2025-01-01",
+            end_date="2025-01-31",
+            fields=["campaign_name", "spend", "impressions"],
+            level="campaign",
+            campaign_ids=["120235919196570172", "120233299253770172"]
+        )
+        
+        **4. Get conversion data with purchases and leads:**
+        get_account_insights(
+            account_id="act_123456789",
+            start_date="2025-01-01",
+            end_date="2025-01-31",
+            fields=["spend", "impressions", "actions", "action_values", "conversions"],
+            level="account"
+        )
+        # Returns: action_purchase, action_lead, action_value_purchase, 
+        #          conversion_schedule_total, etc.
 
     Note:
-        This tool returns ALL results automatically. For large date ranges with
-        daily breakdowns, this may return thousands of rows. The pagination is
-        handled internally - you always get complete results.
+        - Pagination is handled automatically - you get ALL results
+        - For large date ranges with daily breakdowns, expect many rows
+        - To match Facebook UI metrics, calculate CTR/CPC manually from 
+          spend, impressions, and inline_link_clicks
     """
     client = _get_client()
     processor = _get_processor()
@@ -251,7 +384,10 @@ def get_account_insights(
         fields=fields,
         level=level,
         breakdowns=breakdowns,
-        time_increment=time_increment
+        time_increment=time_increment,
+        campaign_ids=campaign_ids,
+        adset_ids=adset_ids,
+        ad_ids=ad_ids
     )
 
     if flatten_actions:
