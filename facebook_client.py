@@ -233,37 +233,44 @@ class FacebookAdsClient:
     def get_ads(
         self,
         account_id: str,
+        campaign_id: Optional[str] = None,
+        adset_id: Optional[str] = None,
         effective_status: Optional[List[str]] = None,
         limit: int = 100
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Retrieve all ads for specified ad account.
+        Retrieve all ads for specified ad account, campaign, or ad set.
 
         Returns all ads automatically with pagination handled internally.
 
         Args:
             account_id: Facebook ad account ID (with or without 'act_' prefix)
+            campaign_id: Optional campaign ID to list ads for a specific campaign
+            adset_id: Optional ad set ID to list ads for a specific ad set
             effective_status: Filter by ad status
             limit: Results per page for internal batching (default: 100)
 
         Returns:
             Dictionary containing list of all ads
         """
-        if not account_id.startswith('act_'):
-            account_id = f'act_{account_id}'
-
         params = {
-            'fields': 'id,name,status,effective_status,creative{id,title,body,image_url},created_time,updated_time',
+            'fields': 'id,name,status,effective_status,creative{id,title,body,image_url},preview_shareable_link,created_time,updated_time',
             'limit': limit
         }
 
         if effective_status:
             params['effective_status'] = json.dumps(effective_status)
 
-        return self._make_paginated_request(
-            f"/{account_id}/ads",
-            params=params
-        )
+        if adset_id:
+            endpoint = f"/{adset_id}/ads"
+        elif campaign_id:
+            endpoint = f"/{campaign_id}/ads"
+        else:
+            if not account_id.startswith('act_'):
+                account_id = f'act_{account_id}'
+            endpoint = f"/{account_id}/ads"
+
+        return self._make_paginated_request(endpoint, params=params)
 
     def get_account_insights(
         self,

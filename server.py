@@ -176,15 +176,22 @@ def list_ad_sets(
 @mcp.tool()
 def list_ads(
     account_id: str,
+    campaign_id: Optional[str] = None,
+    adset_id: Optional[str] = None,
     status_filter: Optional[str] = None
 ) -> List[dict]:
     """
-    Get all ads for a Facebook ad account.
+    Get all ads for a Facebook ad account, specific campaign, or specific ad set.
 
     Automatically fetches all pages of results and returns complete list.
+    For large accounts, filter by campaign_id or adset_id to avoid timeouts.
 
     Args:
         account_id: Ad account ID (with or without 'act_' prefix)
+        campaign_id: Optional campaign ID to list ads for a specific campaign only.
+            Use list_campaigns() first to find the campaign ID.
+        adset_id: Optional ad set ID to list ads for a specific ad set only.
+            Use list_ad_sets() first to find the ad set ID.
         status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all
 
     Returns:
@@ -194,15 +201,31 @@ def list_ads(
         - status: Ad status
         - effective_status: Effective status
         - creative: Creative object with id, title, body, image_url
+        - preview_shareable_link: Public preview URL (fb.me short link) that
+              anyone can open without logging in - useful for sharing with clients
         - created_time: Creation timestamp
         - updated_time: Last update timestamp
 
-    Example:
-        Get all ads for account "123456".
+    Examples:
+        **1. Get all active ads for an account:**
+        list_ads(account_id="act_123456789", status_filter="ACTIVE")
+
+        **2. Get ads for a specific campaign (recommended for large accounts):**
+        list_ads(account_id="act_123456789", campaign_id="120239672137210575")
+
+        **3. Get ads for a specific ad set:**
+        list_ads(account_id="act_123456789", adset_id="120239672137220575")
+
+        **4. Workflow to get preview links for a campaign:**
+        # Step 1: Find the campaign
+        campaigns = list_campaigns(account_id="act_123456789")
+        # Step 2: Get ads with preview links
+        ads = list_ads(account_id="act_123456789", campaign_id="<campaign_id>")
+        # Step 3: Share the preview_shareable_link values with the client
     """
     client = _get_client()
     effective_status = [status_filter] if status_filter else None
-    response = client.get_ads(account_id, effective_status=effective_status)
+    response = client.get_ads(account_id, campaign_id=campaign_id, adset_id=adset_id, effective_status=effective_status)
     return response.get('data', [])
 
 

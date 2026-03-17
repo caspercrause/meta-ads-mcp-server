@@ -201,6 +201,27 @@ list_ads(
 )
 ```
 
+**Returns:**
+- `id`: Ad ID
+- `name`: Ad name
+- `status`: Ad status
+- `effective_status`: Effective status
+- `creative`: Creative object with id, title, body, image_url
+- `preview_shareable_link`: Public preview URL (fb.me short link) - see caveats below
+- `created_time`: Creation timestamp
+- `updated_time`: Last update timestamp
+
+#### Ad Preview Links
+
+The `list_ads` tool includes a `preview_shareable_link` field for each ad. This is a public fb.me short URL that anyone can open without needing Facebook Ads Manager access, making it useful for sharing ad previews with stakeholders.
+
+**Caveats:**
+
+- **Temporary links**: Preview links are temporary. For draft or unpublished ads, links expire after approximately 30 days. Published ads may retain valid links longer, but they should not be treated as permanent.
+- **Unique per request**: Each API call generates a new short URL for the same ad. Do not cache or store these links for long-term reference - fetch fresh links when needed.
+- **Policy-rejected ads**: If Meta rejects an ad for policy violations, the preview link will stop working.
+- **No login required**: Anyone with the link can view the ad preview. Be mindful when sharing links to ads that have not yet been approved or published.
+
 ### Performance Reporting
 
 #### get_account_insights
