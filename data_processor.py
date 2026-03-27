@@ -57,6 +57,23 @@ class FacebookDataProcessor:
         """
         flat: Dict[str, Any] = {}
 
+        # 'actions' vs 'conversions' - when to use which:
+        #
+        # 'actions' + specific custom conversion IDs (e.g. offsite_conversion.custom.123456789):
+        #   Use when custom conversions are REGISTERED in Events Manager.
+        #   Each registered conversion has a unique ID, so actions returns an exact count.
+        #   Supports action_attribution_windows for click/view split natively.
+        #
+        # 'conversions' + goal-based types (e.g. fb_pixel_custom.all_types_of_leads):
+        #   Use when custom conversions are NOT registered in Events Manager,
+        #   but GTM tags are firing and visible in the pixel. The ad set can still
+        #   optimize on these events (e.g. all_types_of_leads), but without registered
+        #   IDs there's no specific action type to filter on.
+        #   Querying 'actions' with fb_pixel_custom returns ALL custom pixel fires,
+        #   which over-counts vs the UI. The 'conversions' field returns only events
+        #   matching the ad set's optimization goal, matching the UI "Results" column.
+        #   Also supports action_attribution_windows for click/view split.
+
         for key, value in item.items():
             if key == 'actions' and isinstance(value, list):
                 # Flatten actions array into separate fields
@@ -89,6 +106,10 @@ class FacebookDataProcessor:
                         # Filter if conversion_types specified
                         if conversion_types is None or conv_type in conversion_types:
                             flat[f'conversion_{conv_type}'] = conv_val
+                            # Extract windowed values (7d_click, 1d_view) if present
+                            for window in ['7d_click', '1d_view', '28d_click', '1d_click']:
+                                if window in conversion:
+                                    flat[f'conversion_{conv_type}_{window}'] = conversion[window]
                 else:
                     # Dict format: {'schedule_total': '296', 'find_location_total': '1449'}
                     # This is the actual format returned by Facebook API

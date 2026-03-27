@@ -310,7 +310,7 @@ def get_account_insights(
             - ['age', 'gender']: By age AND gender
             - ['country']: By country
             - ['publisher_platform']: By platform (Facebook, Instagram, etc.)
-            
+
         time_increment: Time granularity for the data:
             - '1': Daily breakdown (one row per day)
             - '7': Weekly breakdown
