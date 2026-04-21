@@ -10,9 +10,22 @@ Transport Method:
     through stdin/stdout, making it compatible with any MCP-compliant client.
 """
 from typing import List, Optional
+from datetime import datetime, timezone
 from fastmcp import FastMCP
 from facebook_client import FacebookAdsClient
 from data_processor import FacebookDataProcessor
+
+# Pixel stats accepts either ISO 8601 or Unix epoch. We convert YYYY-MM-DD to
+# Unix epoch (start-of-day UTC) so the parameter behavior is unambiguous.
+# We deliberately do not allowlist aggregation values client-side: Meta keeps
+# adding new ones and a hardcoded list drifts. If the value is invalid Meta
+# returns a clear error listing the currently valid options.
+
+
+def _date_to_unix(date_str: str) -> int:
+    """Convert a YYYY-MM-DD string to a Unix epoch (start of day, UTC)."""
+    dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 # Initialize FastMCP server
 # The server will communicate using stdio transport by default
@@ -460,6 +473,281 @@ def get_campaign_insights(
         time_increment=time_increment,
         flatten_actions=flatten_actions
     )
+
+
+@mcp.tool()
+def list_pixels(account_id: str) -> List[dict]:
+    """
+    List all Meta Pixels (datasets) on a Facebook ad account.
+
+    Use this as the entry point for any pixel-related work. The returned
+    `id` is the pixel/dataset ID needed by get_pixel_stats and
+    get_pixel_health. The `last_fired_time` field is the cheapest signal
+    for "is this pixel still receiving traffic?".
+
+    Args:
+        account_id: Ad account ID (with or without 'act_' prefix)
+            Example: "act_123456789" or "123456789"
+
+    Returns:
+        List of pixel dictionaries with keys:
+        - id: Pixel/dataset ID (USE THIS for other pixel tools)
+        - name: Pixel name
+        - last_fired_time: ISO timestamp of the most recent event received
+              (None if the pixel has never fired)
+        - creation_time: ISO timestamp when the pixel was created
+        - is_unavailable: True if the pixel is no longer accessible
+        - is_created_by_business: True if owned by a Business Manager
+        - data_use_setting: 'ADVERTISING_AND_ANALYTICS' or 'ANALYTICS_ONLY'
+        - enable_automatic_matching: Whether Advanced Matching is enabled
+        - first_party_cookie_status: Cookie status string
+        - owner_ad_account: {id, name} of the owning ad account if applicable
+
+    Examples:
+        **1. Find pixels for an account:**
+        pixels = list_pixels(account_id="act_123456789")
+
+        **2. Quick health check across all pixels:**
+        pixels = list_pixels(account_id="act_123456789")
+        # Sort by last_fired_time to spot pixels that have gone quiet
+        for p in pixels:
+            print(p["name"], p.get("last_fired_time"))
+
+    Note:
+        Requires `ads_read` permission. Pagination handled internally.
+    """
+    client = _get_client()
+    response = client.get_pixels(account_id)
+    return response.get('data', [])
+
+
+@mcp.tool()
+def get_pixel_stats(
+    pixel_id: str,
+    start_date: str,
+    end_date: str,
+    aggregation: str = "event",
+    event: Optional[str] = None
+) -> List[dict]:
+    """
+    Get event activity stats for a Meta Pixel, bucketed by a chosen dimension.
+
+    This is the swiss army knife for pixel diagnostics. Pick an aggregation
+    to answer different questions:
+
+    - 'event': Volume per event type (Purchase, Lead, PageView, ...)
+    - 'pixel_fire': Browser-vs-server (CAPI) split
+    - 'host': Top firing domains - useful for spotting unauthorized fires
+    - 'browser_type' / 'device_os' / 'device_type': Traffic mix
+    - 'url' / 'url_by_rule': Top firing pages
+    - 'custom_data_field': Custom event parameter breakdowns
+    - 'match_keys' / 'had_pii': Advanced Matching diagnostics
+    - 'event_detection_method' / 'event_source' / 'event_processing_results':
+      Pipeline diagnostics
+    - 'event_value_count' / 'event_total_counts': Aggregate event volume
+
+    Args:
+        pixel_id: Pixel/dataset ID (use list_pixels first to get this)
+        start_date: Start date in YYYY-MM-DD format (UTC)
+        end_date: End date in YYYY-MM-DD format (UTC)
+        aggregation: Dimension to bucket by. Common values: 'event',
+            'pixel_fire', 'host', 'browser_type', 'device_os', 'device_type',
+            'url', 'custom_data_field' (default: 'event'). If you pass an
+            invalid value, Meta returns an error listing the currently
+            supported options.
+        event: Optional event name to filter to (e.g. 'Purchase', 'Lead').
+            Only meaningful when combined with non-event aggregations.
+
+    Returns:
+        List of stat-row dictionaries. Each row typically contains:
+        - start_time: Bucket start time
+        - value: Numeric count for the bucket
+        - data: Bucketed dimension breakdown (shape depends on aggregation)
+
+    Note:
+        Facebook returns this data at HOURLY granularity by default. A
+        7-day window will return ~168 rows per dimension value. For
+        wider date ranges, prefer narrow windows or aggregate the
+        returned rows by date client-side.
+
+    Examples:
+        **1. Event volume for the last 7 days:**
+        get_pixel_stats(
+            pixel_id="123456789",
+            start_date="2026-04-14",
+            end_date="2026-04-21",
+            aggregation="event"
+        )
+
+        **2. CAPI vs browser fire split for purchases:**
+        get_pixel_stats(
+            pixel_id="123456789",
+            start_date="2026-04-01",
+            end_date="2026-04-21",
+            aggregation="pixel_fire",
+            event="Purchase"
+        )
+
+        **3. Find unauthorized domains firing the pixel:**
+        get_pixel_stats(
+            pixel_id="123456789",
+            start_date="2026-04-14",
+            end_date="2026-04-21",
+            aggregation="host"
+        )
+
+    """
+    client = _get_client()
+    response = client.get_pixel_stats(
+        pixel_id=pixel_id,
+        start_time=str(_date_to_unix(start_date)),
+        end_time=str(_date_to_unix(end_date)),
+        aggregation=aggregation,
+        event=event
+    )
+    return response.get('data', [])
+
+
+@mcp.tool()
+def list_custom_conversions(account_id: str) -> List[dict]:
+    """
+    List all custom conversions for a Facebook ad account.
+
+    Custom conversions are what most campaigns optimize against, so the
+    `last_fired_time` field is often the fastest way to detect a broken
+    tracking setup. The `event_source_id` field tells you which pixel
+    each custom conversion is attached to.
+
+    Args:
+        account_id: Ad account ID (with or without 'act_' prefix)
+
+    Returns:
+        List of custom conversion dictionaries with keys:
+        - id: Custom conversion ID (use for get_custom_conversion_stats)
+        - name: Display name
+        - description: Optional description
+        - custom_event_type: PURCHASE, LEAD, ADD_TO_CART, OTHER, ...
+        - rule: JSON rule string used to match incoming events
+        - event_source_id: Linked pixel ID
+        - first_fired_time: First time this conversion fired (ISO timestamp)
+        - last_fired_time: Most recent fire (ISO timestamp). None if it has
+              never fired - usually indicates a broken setup.
+        - is_archived: True if archived
+        - is_unavailable: True if no longer accessible
+        - retention_days: Days events are retained (typically 28-90)
+        - default_conversion_value: Default monetary value
+        - creation_time: ISO timestamp when the conversion was created
+
+    Note:
+        Facebook caps custom conversions at 100 per ad account.
+        Pagination handled internally.
+    """
+    client = _get_client()
+    response = client.get_custom_conversions(account_id)
+    return response.get('data', [])
+
+
+@mcp.tool()
+def get_custom_conversion_stats(
+    custom_conversion_id: str,
+    start_date: str,
+    end_date: str,
+    aggregation: str = "count"
+) -> List[dict]:
+    """
+    Get fire-volume stats for a single custom conversion over a date range.
+
+    Use this to verify a custom conversion is firing as expected, or to
+    chart its volume over time independent of any campaign attribution.
+
+    Args:
+        custom_conversion_id: Custom conversion ID (from list_custom_conversions)
+        start_date: Start date in YYYY-MM-DD format (UTC)
+        end_date: End date in YYYY-MM-DD format (UTC)
+        aggregation: Aggregation mode. One of: 'count' (fire count),
+            'usd_amount' (monetary value), 'unmatched_count',
+            'unmatched_usd_amount', 'device_type', 'host', 'pixel_fire',
+            'url' (default: 'count'). If invalid, Meta returns an error
+            listing the currently supported options.
+
+    Returns:
+        List of stat-row dictionaries. Typical shape:
+        - timestamp: Bucket start time
+        - data: Aggregated value(s) for the bucket
+
+    Note:
+        Facebook returns this data at HOURLY granularity by default. A
+        7-day window can return 100+ rows. Aggregate the returned rows
+        by date client-side if you need a daily view.
+    """
+    client = _get_client()
+    response = client.get_custom_conversion_stats(
+        custom_conversion_id=custom_conversion_id,
+        start_time=str(_date_to_unix(start_date)),
+        end_time=str(_date_to_unix(end_date)),
+        aggregation=aggregation
+    )
+    return response.get('data', [])
+
+
+@mcp.tool()
+def get_pixel_health(pixel_id: str) -> dict:
+    """
+    Get a composite health snapshot for a Meta Pixel.
+
+    Combines two diagnostic surfaces:
+    - `da_checks`: Per-rule diagnostic checks with PASS/WARN/FAIL results
+    - Dataset-quality fields: Event Match Quality summary, automatic
+      matching fields, last fired time
+
+    The dataset-quality portion may require additional permissions
+    (`business_management`) and a System User token. If that call fails,
+    only `da_checks` is returned and `dataset_quality_error` describes the
+    failure - the tool degrades gracefully rather than erroring out.
+
+    Args:
+        pixel_id: Pixel/dataset ID
+
+    Returns:
+        Dictionary with keys:
+        - pixel_id: The input pixel ID
+        - da_checks: List of DACheck objects (key, description, result, ...).
+              None if the diagnostics call failed.
+        - da_checks_error: Error string if da_checks failed, else None.
+        - dataset_quality: Dict of quality fields (last_fired_time,
+              aggregated_event_match_quality_summary, ...).
+              None if the quality call failed (often a permissions issue).
+        - dataset_quality_error: Error string if quality failed, else None.
+
+    Examples:
+        **1. Quick health check on a pixel:**
+        health = get_pixel_health(pixel_id="123456789")
+        if health["da_checks"]:
+            failed = [c for c in health["da_checks"]
+                      if c.get("result") == "FAIL"]
+            print(f"{len(failed)} failed diagnostic checks")
+    """
+    client = _get_client()
+    result: dict = {
+        'pixel_id': pixel_id,
+        'da_checks': None,
+        'da_checks_error': None,
+        'dataset_quality': None,
+        'dataset_quality_error': None,
+    }
+
+    try:
+        da_response = client.get_pixel_da_checks(pixel_id)
+        result['da_checks'] = da_response.get('data', [])
+    except Exception as e:
+        result['da_checks_error'] = str(e)
+
+    try:
+        result['dataset_quality'] = client.get_pixel_dataset_quality(pixel_id)
+    except Exception as e:
+        result['dataset_quality_error'] = str(e)
+
+    return result
 
 
 # Run the server

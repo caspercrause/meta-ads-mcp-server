@@ -363,3 +363,212 @@ class FacebookAdsClient:
             f"/{account_id}/insights",
             params=params
         )
+
+    # ------------------------------------------------------------------
+    # Pixel and Custom Conversion endpoints
+    # ------------------------------------------------------------------
+
+    def get_pixels(
+        self,
+        account_id: str,
+        limit: int = 100
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Retrieve all Meta Pixels (datasets) on an ad account.
+
+        Args:
+            account_id: Facebook ad account ID (with or without 'act_' prefix)
+            limit: Results per page for internal batching (default: 100)
+
+        Returns:
+            Dictionary containing list of all pixels with keys:
+            - id: Pixel/dataset ID (use this for pixel-stats and health calls)
+            - name: Pixel name
+            - last_fired_time: ISO timestamp of the most recent event received
+            - creation_time: ISO timestamp when the pixel was created
+            - is_unavailable: True if the pixel is no longer accessible
+            - is_created_by_business: True if owned by a Business Manager
+            - data_use_setting: ADVERTISING_AND_ANALYTICS or ANALYTICS_ONLY
+            - enable_automatic_matching: Whether Advanced Matching is on
+            - first_party_cookie_status: FIRST_PARTY_COOKIE_ENABLED / DISABLED
+        """
+        if not account_id.startswith('act_'):
+            account_id = f'act_{account_id}'
+
+        # owner_ad_account{id,name} is intentionally excluded: that sub-query
+        # reads the linked ad account's metadata, and Meta rejects the entire
+        # request with error 200 if the token lacks read access on the linked
+        # account, even when the caller has full access to the account being
+        # queried. The owning account is usually the same as account_id.
+        params = {
+            'fields': (
+                'id,name,last_fired_time,creation_time,is_unavailable,'
+                'is_created_by_business,data_use_setting,'
+                'enable_automatic_matching,first_party_cookie_status,'
+                'can_proxy'
+            ),
+            'limit': limit
+        }
+
+        return self._make_paginated_request(
+            f"/{account_id}/adspixels",
+            params=params
+        )
+
+    def get_pixel_stats(
+        self,
+        pixel_id: str,
+        start_time: str,
+        end_time: str,
+        aggregation: str = 'event',
+        event: Optional[str] = None,
+        limit: int = 100
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Retrieve event stats for a Meta Pixel, bucketed by an aggregation dimension.
+
+        Args:
+            pixel_id: Meta Pixel/dataset ID
+            start_time: ISO 8601 string or Unix epoch (e.g. "2025-01-01")
+            end_time: ISO 8601 string or Unix epoch
+            aggregation: One of 'event', 'browser_type', 'device_os',
+                'device_type', 'host', 'pixel_fire', 'url',
+                'custom_data_field', 'placement'
+            event: Optional event name to filter to (e.g. 'Purchase', 'Lead')
+            limit: Results per page for internal batching
+
+        Returns:
+            Dictionary with 'data' key containing stat rows. Each row has:
+            - start_time: Bucket start time
+            - value: Numeric count for the bucket
+            - data: Bucketed dimension breakdown (depends on aggregation)
+        """
+        params: Dict[str, Any] = {
+            'aggregation': aggregation,
+            'start_time': start_time,
+            'end_time': end_time,
+            'limit': limit
+        }
+        if event:
+            params['event'] = event
+
+        return self._make_paginated_request(
+            f"/{pixel_id}/stats",
+            params=params
+        )
+
+    def get_pixel_da_checks(self, pixel_id: str) -> Dict[str, Any]:
+        """
+        Retrieve diagnostic checks (DACheck) for a Meta Pixel.
+
+        Each check reports a key, description, result (PASS/WARN/FAIL),
+        and a user-facing message. Useful as a quick health snapshot.
+
+        Args:
+            pixel_id: Meta Pixel/dataset ID
+
+        Returns:
+            Raw API response with 'data' list of DACheck objects
+        """
+        return self._make_request(f"/{pixel_id}/da_checks")
+
+    def get_pixel_dataset_quality(self, pixel_id: str) -> Dict[str, Any]:
+        """
+        Retrieve dataset quality fields for a Meta Pixel.
+
+        Reads the pixel object with the extended diagnostic fields that are
+        publicly exposed on the Graph API. Note that the full Event Match
+        Quality (EMQ) summary is not available via this endpoint - see the
+        Dataset Quality dashboard in Events Manager for that.
+
+        Args:
+            pixel_id: Meta Pixel/dataset ID
+
+        Returns:
+            Raw API response with available diagnostic fields
+        """
+        params = {
+            'fields': (
+                'id,name,last_fired_time,automatic_matching_fields,'
+                'enable_automatic_matching,first_party_cookie_status,'
+                'data_use_setting'
+            )
+        }
+        return self._make_request(f"/{pixel_id}", params=params)
+
+    def get_custom_conversions(
+        self,
+        account_id: str,
+        limit: int = 100
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Retrieve all custom conversions for an ad account.
+
+        Args:
+            account_id: Facebook ad account ID (with or without 'act_' prefix)
+            limit: Results per page for internal batching
+
+        Returns:
+            Dictionary containing list of custom conversions with keys:
+            - id: Custom conversion ID
+            - name: Display name
+            - description: Optional description
+            - custom_event_type: PURCHASE, LEAD, ADD_TO_CART, OTHER, ...
+            - rule: JSON rule string used to match events
+            - event_source_id: Linked pixel ID
+            - first_fired_time: First time this conversion fired
+            - last_fired_time: Most recent fire (cheapest "is it broken?" signal)
+            - is_archived: True if archived
+            - is_unavailable: True if no longer accessible
+            - retention_days: Days events are retained
+            - default_conversion_value: Default monetary value
+        """
+        if not account_id.startswith('act_'):
+            account_id = f'act_{account_id}'
+
+        params = {
+            'fields': (
+                'id,name,description,custom_event_type,rule,event_source_id,'
+                'first_fired_time,last_fired_time,is_archived,is_unavailable,'
+                'retention_days,default_conversion_value,creation_time'
+            ),
+            'limit': limit
+        }
+
+        return self._make_paginated_request(
+            f"/{account_id}/customconversions",
+            params=params
+        )
+
+    def get_custom_conversion_stats(
+        self,
+        custom_conversion_id: str,
+        start_time: str,
+        end_time: str,
+        aggregation: str = 'count',
+        limit: int = 100
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Retrieve stats for a single custom conversion.
+
+        Args:
+            custom_conversion_id: Custom conversion ID
+            start_time: ISO 8601 string or Unix epoch
+            end_time: ISO 8601 string or Unix epoch
+            aggregation: Aggregation mode (e.g. 'count', 'value', 'count_unique_users')
+            limit: Results per page for internal batching
+
+        Returns:
+            Dictionary with 'data' key containing stat rows
+        """
+        params: Dict[str, Any] = {
+            'aggregation': aggregation,
+            'start_time': start_time,
+            'end_time': end_time,
+            'limit': limit
+        }
+
+        return self._make_paginated_request(
+            f"/{custom_conversion_id}/stats",
+            params=params
+        )
