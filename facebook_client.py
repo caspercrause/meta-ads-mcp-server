@@ -195,40 +195,65 @@ class FacebookAdsClient:
             params=params
         )
 
+    DEFAULT_AD_SET_FIELDS = [
+        'id',
+        'name',
+        'campaign_id',
+        'status',
+        'effective_status',
+        'daily_budget',
+        'lifetime_budget',
+        'promoted_object',
+        'created_time',
+        'updated_time',
+    ]
+
     def get_ad_sets(
         self,
         account_id: str,
+        campaign_id: Optional[str] = None,
         effective_status: Optional[List[str]] = None,
+        fields: Optional[List[str]] = None,
         limit: int = 100
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Retrieve all ad sets for specified ad account.
+        Retrieve all ad sets for specified ad account or campaign.
 
         Returns all ad sets automatically with pagination handled internally.
 
         Args:
-            account_id: Facebook ad account ID (with or without 'act_' prefix)
+            account_id: Facebook ad account ID (with or without 'act_' prefix).
+                Used when campaign_id is not provided.
+            campaign_id: Optional campaign ID to scope ad sets to a single
+                campaign. When provided, hits /{campaign_id}/adsets and
+                account_id is ignored.
             effective_status: Filter by ad set status
+            fields: Override the default field list. Pass None to use
+                DEFAULT_AD_SET_FIELDS (lean, no targeting). Pass an explicit
+                list to request specific fields. Heavy fields like
+                'targeting' can multiply response size by 10x or more.
             limit: Results per page for internal batching (default: 100)
 
         Returns:
             Dictionary containing list of all ad sets
         """
-        if not account_id.startswith('act_'):
-            account_id = f'act_{account_id}'
-
+        field_list = fields if fields is not None else self.DEFAULT_AD_SET_FIELDS
         params = {
-            'fields': 'id,name,status,effective_status,daily_budget,lifetime_budget,targeting,created_time,updated_time',
+            'fields': ','.join(field_list),
             'limit': limit
         }
 
         if effective_status:
             params['effective_status'] = json.dumps(effective_status)
 
-        return self._make_paginated_request(
-            f"/{account_id}/adsets",
-            params=params
-        )
+        if campaign_id:
+            endpoint = f"/{campaign_id}/adsets"
+        else:
+            if not account_id.startswith('act_'):
+                account_id = f'act_{account_id}'
+            endpoint = f"/{account_id}/adsets"
+
+        return self._make_paginated_request(endpoint, params=params)
 
     def get_ads(
         self,
@@ -254,7 +279,7 @@ class FacebookAdsClient:
             Dictionary containing list of all ads
         """
         params = {
-            'fields': 'id,name,status,effective_status,creative{id,title,body,image_url},preview_shareable_link,created_time,updated_time',
+            'fields': 'id,name,campaign_id,adset_id,status,effective_status,creative{id,title,body,image_url},preview_shareable_link,created_time,updated_time',
             'limit': limit
         }
 

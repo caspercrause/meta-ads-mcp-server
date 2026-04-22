@@ -154,35 +154,110 @@ def list_campaigns(
 @mcp.tool()
 def list_ad_sets(
     account_id: str,
-    status_filter: Optional[str] = None
+    campaign_id: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    fields: Optional[List[str]] = None
 ) -> List[dict]:
     """
-    Get all ad sets for a Facebook ad account.
+    Get all ad sets for a Facebook ad account or single campaign.
+
+    !!! TOKEN BUDGET WARNING !!!
+    This tool can return VERY LARGE responses for accounts with many ad sets.
+    A single account with ~90 ad sets can produce 100,000+ characters of JSON
+    if heavy fields like 'targeting' are requested. The default field list is
+    intentionally LEAN to keep responses manageable. Use this tool freely,
+    but it is super important to scope it.
+
+    USE THIS TOOL SPARINGLY:
+    - PREFER campaign_id whenever you are working on a specific campaign
+        (QA, budget review, naming audit, pixel check, etc.). Scoping to
+        one campaign is the single biggest token reduction available; an
+        account with 90 ad sets across 20 campaigns drops to 4-5 rows per
+        call.
+    - PREFER status_filter='ACTIVE' for any current-state question;
+        archived/paused ad sets accumulate over years and can 10x your
+        result size for no benefit. Drop the filter only when you
+        specifically need historical or paused entries.
+    - DO NOT request the 'targeting' field unless you specifically need it.
+        Targeting structs are nested objects with geo, age, interests,
+        behaviours, custom audiences, etc., and are the single biggest
+        bloater of this response.
+    - If you only need pixel selection, the default fields already include
+        'promoted_object' which contains the pixel_id.
+    - If the response still exceeds the token cap, the runtime will save
+        it to disk and you will be working with a file blob, not a usable
+        list. Avoid this by being precise about which fields you need.
 
     Automatically fetches all pages of results and returns complete list.
 
     Args:
-        account_id: Ad account ID (with or without 'act_' prefix)
-        status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all
+        account_id: Ad account ID (with or without 'act_' prefix). Used
+            when campaign_id is not provided.
+        campaign_id: Optional campaign ID to scope ad sets to a single
+            campaign (recommended for QA workflows). Use list_campaigns()
+            first to find the campaign ID. When provided, account_id is
+            still required for symmetry but is not used.
+        status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all.
+            Strongly prefer 'ACTIVE' unless you have a specific reason otherwise.
+        fields: Optional override of the field list. Pass None (default) to
+            get the lean default set listed below. Pass an explicit list
+            (e.g. ['id', 'name', 'targeting']) only when you genuinely need
+            extra fields. Heavy fields you can opt into when needed:
+            - 'targeting' (HEAVY: nested geo/interest/behaviour struct)
+            - 'optimization_goal', 'billing_event', 'bid_strategy'
+            - 'attribution_spec', 'destination_type', 'pacing_type'
+            - 'start_time', 'end_time', 'budget_remaining'
+            See https://developers.facebook.com/docs/marketing-api/reference/ad-campaign/
+            for the full schema.
 
-    Returns:
-        Complete list of all ad sets with keys:
+    Returns (default field list):
+        Complete list of ad sets with keys:
         - id: Ad set ID
         - name: Ad set name
+        - campaign_id: Parent campaign ID (use to group ad sets by campaign
+            or to cross-reference with list_campaigns)
         - status: Ad set status
         - effective_status: Effective status
         - daily_budget: Daily budget in cents
         - lifetime_budget: Lifetime budget in cents
-        - targeting: Targeting specifications
+        - promoted_object: What this ad set is optimizing for. Only populated
+            for objectives that require an optimization target. Common keys:
+            - pixel_id: Facebook pixel ID being fired against (use with
+                get_pixel_stats / get_pixel_health)
+            - custom_event_type: Standard event name (e.g. 'LEAD', 'PURCHASE',
+                'COMPLETE_REGISTRATION', 'OTHER')
+            - custom_event_str: Custom event string when custom_event_type='OTHER'
+            - custom_conversion_id: Custom conversion ID (use with
+                get_custom_conversion_stats)
+            - page_id: Facebook Page ID for engagement / page-promotion ad sets
+            - application_id: App ID for app-install ad sets
+            Empty/missing for awareness, reach, and other non-conversion objectives.
         - created_time: Creation timestamp
         - updated_time: Last update timestamp
 
-    Example:
-        Get all active ad sets for account "123456".
+    Examples:
+        **1. QA pixel assignment for a single campaign (recommended):**
+        list_ad_sets(account_id="act_123", campaign_id="120239...", status_filter="ACTIVE")
+        # Each row's promoted_object.pixel_id tells you which pixel is selected
+        # (or empty if no pixel was assigned, which is often the bug to detect)
+
+        **2. Audit pixel usage across an entire account:**
+        list_ad_sets(account_id="act_123", status_filter="ACTIVE")
+        # Group results by promoted_object.pixel_id to see which pixels are in use
+
+        **3. Audit daily budgets across one campaign's ad sets (general use):**
+        list_ad_sets(account_id="act_123", campaign_id="120239...", status_filter="ACTIVE")
+        # Sum or compare daily_budget / lifetime_budget across the returned rows.
+        # The default field list already includes both budgets, no extra fields needed.
     """
     client = _get_client()
     effective_status = [status_filter] if status_filter else None
-    response = client.get_ad_sets(account_id, effective_status=effective_status)
+    response = client.get_ad_sets(
+        account_id,
+        campaign_id=campaign_id,
+        effective_status=effective_status,
+        fields=fields,
+    )
     return response.get('data', [])
 
 
@@ -211,6 +286,9 @@ def list_ads(
         Complete list of all ads with keys:
         - id: Ad ID
         - name: Ad name
+        - campaign_id: Parent campaign ID (use to group ads by campaign)
+        - adset_id: Parent ad set ID (use to cross-reference with list_ad_sets,
+            e.g. to find which pixel this ad is firing against)
         - status: Ad status
         - effective_status: Effective status
         - creative: Creative object with id, title, body, image_url
