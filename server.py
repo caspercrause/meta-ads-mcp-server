@@ -10,9 +10,8 @@ Transport Method:
     through stdin/stdout, making it compatible with any MCP-compliant client.
 """
 from typing import List, Optional
-from datetime import datetime, timezone
 from fastmcp import FastMCP
-from facebook_client import FacebookAdsClient
+from facebook_client import FacebookAdsClient, _date_to_unix
 from data_processor import FacebookDataProcessor
 
 # Pixel stats accepts either ISO 8601 or Unix epoch. We convert YYYY-MM-DD to
@@ -20,12 +19,6 @@ from data_processor import FacebookDataProcessor
 # We deliberately do not allowlist aggregation values client-side: Meta keeps
 # adding new ones and a hardcoded list drifts. If the value is invalid Meta
 # returns a clear error listing the currently valid options.
-
-
-def _date_to_unix(date_str: str) -> int:
-    """Convert a YYYY-MM-DD string to a Unix epoch (start of day, UTC)."""
-    dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
 
 # Initialize FastMCP server
 # The server will communicate using stdio transport by default
@@ -89,65 +82,85 @@ def list_ad_accounts() -> List[dict]:
 @mcp.tool()
 def list_campaigns(
     account_id: str,
-    status_filter: Optional[str] = None
+    status_filter: Optional[str] = None,
+    name_contains: Optional[str] = None,
+    objective: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    updated_after: Optional[str] = None,
+    extra_filters: Optional[List[dict]] = None
 ) -> List[dict]:
     """
-    Get all campaigns for a Facebook ad account.
+    Get all campaigns for a Facebook ad account, with server-side filtering.
 
-    Automatically fetches all pages of results and returns complete list.
-    No manual pagination required.
-    
-    **USE THIS TOOL TO GET CAMPAIGN IDs FOR FILTERING:**
-    When user wants insights for specific campaigns (e.g., "all French campaigns"):
-    1. Call this tool to get all campaigns
-    2. Filter results by campaign name pattern (e.g., names containing "FR")
-    3. Extract the 'id' field from matching campaigns
-    4. Pass those IDs to get_account_insights(campaign_ids=[...])
+    Automatically fetches all pages and returns the complete filtered list.
+    Prefer the filter kwargs over fetching everything and filtering in Python -
+    they push the work to Meta's API and dramatically shrink the response on
+    large accounts.
 
     Args:
-        account_id: Ad account ID (with or without 'act_' prefix)
+        account_id: Ad account ID (with or without 'act_' prefix).
             Example: "act_123456789" or "123456789"
-        status_filter: Filter by status (optional):
-            - 'ACTIVE': Only active campaigns
-            - 'PAUSED': Only paused campaigns
-            - 'ARCHIVED': Only archived campaigns
-            - None: All campaigns (default)
+        status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or
+            None for all (default).
+        name_contains: Substring of campaign name. CASE-SENSITIVE on Meta's
+            side - lowercase your pattern if names are mixed case. This is
+            the ONLY name-matching operator Meta accepts on the campaigns /
+            adsets / ads endpoints; for prefix-style matching, anchor the
+            substring (e.g. name_contains="S18 |").
+        objective: Single objective value. Compiled to Meta's IN operator
+            (Meta does not accept EQUAL on objective).
+            ODAX values: 'OUTCOME_LEADS', 'OUTCOME_SALES',
+            'OUTCOME_TRAFFIC', 'OUTCOME_AWARENESS', 'OUTCOME_ENGAGEMENT',
+            'OUTCOME_APP_PROMOTION'.
+            **CAVEAT (verified against the live API):** The objective filter
+            matches against the *original* stored value, not the ODAX-
+            normalized read value. New campaigns created with ODAX
+            objectives (e.g. OUTCOME_LEADS) match correctly. OLDER campaigns
+            created with legacy objectives (LINK_CLICKS, CONVERSIONS,
+            BRAND_AWARENESS, REACH, POST_ENGAGEMENT, LEAD_GENERATION,
+            APP_INSTALLS, ...) read back as ODAX values but only match the
+            filter when you pass the legacy name. For a mixed-vintage
+            account, prefer extra_filters with a union list, e.g.:
+            `extra_filters=[{"field": "objective", "operator": "IN",
+            "value": ["OUTCOME_TRAFFIC", "LINK_CLICKS", "TRAFFIC"]}]`.
+        created_after: YYYY-MM-DD - campaigns created strictly after this
+            date (UTC start of day).
+        created_before: YYYY-MM-DD - campaigns created strictly before.
+        updated_after: YYYY-MM-DD - campaigns updated strictly after.
+        extra_filters: Escape hatch for any Meta filter not exposed above.
+            List of {field, operator, value} dicts AND'd with the rest.
+            Example: [{"field": "daily_budget", "operator": "GREATER_THAN",
+            "value": 5000}].
 
     Returns:
-        List of campaign dictionaries with these keys:
-        - id: Campaign ID (USE THIS for filtering in get_account_insights)
-        - name: Campaign name (USE THIS for pattern matching)
-        - status: Campaign status (ACTIVE, PAUSED, etc.)
-        - effective_status: Effective status
-        - objective: Campaign objective
-        - daily_budget: Daily budget in cents (divide by 100 for currency)
-        - lifetime_budget: Lifetime budget in cents
-        - created_time: Creation timestamp
-        - updated_time: Last update timestamp
+        List of campaign dictionaries with id, name, status, effective_status,
+        objective, daily_budget, lifetime_budget, created_time, updated_time.
 
     Examples:
-        **1. Get all active campaigns:**
-        list_campaigns(account_id="act_123456789", status_filter="ACTIVE")
-        
-        **2. Get all campaigns (any status):**
-        list_campaigns(account_id="act_123456789")
-        
-        **3. Workflow to filter campaigns by name pattern:**
-        # Step 1: Get all campaigns
-        campaigns = list_campaigns(account_id="act_123456789")
-        
-        # Step 2: Filter by name (e.g., campaigns containing "CH | FR")
-        # fr_campaigns = [c for c in campaigns if "CH | FR" in c["name"]]
-        
-        # Step 3: Extract IDs
-        # fr_campaign_ids = [c["id"] for c in fr_campaigns]
-        
-        # Step 4: Get insights for those campaigns only
-        # get_account_insights(..., campaign_ids=fr_campaign_ids)
+        **1. Active French-Suisse campaigns:**
+        list_campaigns(account_id="act_123", status_filter="ACTIVE",
+                       name_contains="CH | FR")
+
+        **2. Lead-objective campaigns launched this quarter:**
+        list_campaigns(account_id="act_123", objective="OUTCOME_LEADS",
+                       created_after="2026-01-01")
+
+        **3. Naming-audit by anchored substring (workaround for prefix):**
+        list_campaigns(account_id="act_123", name_contains="S18 |")
     """
     client = _get_client()
     effective_status = [status_filter] if status_filter else None
-    response = client.get_campaigns(account_id, effective_status=effective_status)
+    response = client.get_campaigns(
+        account_id,
+        effective_status=effective_status,
+        name_contains=name_contains,
+        objective=objective,
+        created_after=created_after,
+        created_before=created_before,
+        updated_after=updated_after,
+        extra_filters=extra_filters,
+    )
     return response.get('data', [])
 
 
@@ -156,7 +169,12 @@ def list_ad_sets(
     account_id: str,
     campaign_id: Optional[str] = None,
     status_filter: Optional[str] = None,
-    fields: Optional[List[str]] = None
+    fields: Optional[List[str]] = None,
+    name_contains: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    updated_after: Optional[str] = None,
+    extra_filters: Optional[List[dict]] = None
 ) -> List[dict]:
     """
     Get all ad sets for a Facebook ad account or single campaign.
@@ -209,6 +227,14 @@ def list_ad_sets(
             - 'start_time', 'end_time', 'budget_remaining'
             See https://developers.facebook.com/docs/marketing-api/reference/ad-campaign/
             for the full schema.
+        name_contains: Server-side substring match on ad set name
+            (CASE-SENSITIVE). Meta does not support prefix matching on
+            this field - anchor the substring if you want that semantic.
+        created_after: YYYY-MM-DD floor on created_time.
+        created_before: YYYY-MM-DD ceiling on created_time.
+        updated_after: YYYY-MM-DD floor on updated_time.
+        extra_filters: Escape hatch for any Meta filter not exposed above.
+            List of {field, operator, value} dicts AND'd with the rest.
 
     Returns (default field list):
         Complete list of ad sets with keys:
@@ -249,6 +275,14 @@ def list_ad_sets(
         list_ad_sets(account_id="act_123", campaign_id="120239...", status_filter="ACTIVE")
         # Sum or compare daily_budget / lifetime_budget across the returned rows.
         # The default field list already includes both budgets, no extra fields needed.
+
+        **4. Find ad sets recently launched (using server-side filter):**
+        list_ad_sets(account_id="act_123", status_filter="ACTIVE",
+                     created_after="2026-04-01")
+
+        **5. Naming-convention audit by anchored substring:**
+        list_ad_sets(account_id="act_123", name_contains="W18 |",
+                     status_filter="ACTIVE")
     """
     client = _get_client()
     effective_status = [status_filter] if status_filter else None
@@ -257,6 +291,11 @@ def list_ad_sets(
         campaign_id=campaign_id,
         effective_status=effective_status,
         fields=fields,
+        name_contains=name_contains,
+        created_after=created_after,
+        created_before=created_before,
+        updated_after=updated_after,
+        extra_filters=extra_filters,
     )
     return response.get('data', [])
 
@@ -266,21 +305,34 @@ def list_ads(
     account_id: str,
     campaign_id: Optional[str] = None,
     adset_id: Optional[str] = None,
-    status_filter: Optional[str] = None
+    status_filter: Optional[str] = None,
+    name_contains: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    updated_after: Optional[str] = None,
+    extra_filters: Optional[List[dict]] = None
 ) -> List[dict]:
     """
     Get all ads for a Facebook ad account, specific campaign, or specific ad set.
 
-    Automatically fetches all pages of results and returns complete list.
-    For large accounts, filter by campaign_id or adset_id to avoid timeouts.
+    Automatically fetches all pages and returns the complete filtered list.
+    For large accounts (1000+ ads), ALWAYS pass at least one of campaign_id,
+    adset_id, name_contains, or a date filter - an unfiltered call can blow
+    past the response size limit.
 
     Args:
-        account_id: Ad account ID (with or without 'act_' prefix)
-        campaign_id: Optional campaign ID to list ads for a specific campaign only.
-            Use list_campaigns() first to find the campaign ID.
-        adset_id: Optional ad set ID to list ads for a specific ad set only.
-            Use list_ad_sets() first to find the ad set ID.
-        status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all
+        account_id: Ad account ID (with or without 'act_' prefix).
+        campaign_id: Optional campaign scope. Use list_campaigns() to find IDs.
+        adset_id: Optional ad set scope. Use list_ad_sets() to find IDs.
+        status_filter: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all.
+        name_contains: Server-side substring match on ad name (CASE-SENSITIVE).
+            Meta does not support prefix matching on this field - anchor
+            the substring if you want that semantic.
+        created_after: YYYY-MM-DD floor on created_time.
+        created_before: YYYY-MM-DD ceiling on created_time.
+        updated_after: YYYY-MM-DD floor on updated_time.
+        extra_filters: Escape hatch for any Meta filter not exposed above.
+            List of {field, operator, value} dicts AND'd with the rest.
 
     Returns:
         Complete list of all ads with keys:
@@ -313,11 +365,125 @@ def list_ads(
         # Step 2: Get ads with preview links
         ads = list_ads(account_id="act_123456789", campaign_id="<campaign_id>")
         # Step 3: Share the preview_shareable_link values with the client
+
+        **5. Find ads on a large account by name pattern (avoids dumping
+        thousands of rows):**
+        list_ads(account_id="act_123456789", status_filter="ACTIVE",
+                 name_contains="CH | FR")
+
+        **6. Ads created since the last QA review (date floor):**
+        list_ads(account_id="act_123456789", campaign_id="120239...",
+                 created_after="2026-04-22")
     """
     client = _get_client()
     effective_status = [status_filter] if status_filter else None
-    response = client.get_ads(account_id, campaign_id=campaign_id, adset_id=adset_id, effective_status=effective_status)
+    response = client.get_ads(
+        account_id,
+        campaign_id=campaign_id,
+        adset_id=adset_id,
+        effective_status=effective_status,
+        name_contains=name_contains,
+        created_after=created_after,
+        created_before=created_before,
+        updated_after=updated_after,
+        extra_filters=extra_filters,
+    )
     return response.get('data', [])
+
+
+@mcp.tool()
+def get_ad_creative(creative_id: str) -> dict:
+    """
+    Fetch the full creative details for a given ad creative ID.
+
+    Use this to verify ad copy text against client briefs without
+    opening Ads Manager. list_ads only returns the shallow creative
+    fields (title, body, image_url at the top level); the actual text
+    for carousels and dynamic creatives lives inside object_story_spec
+    and asset_feed_spec, which this tool exposes.
+
+    Args:
+        creative_id: AdCreative ID. Get this from list_ads -> each
+            ad's `creative.id`.
+
+    Returns:
+        Dictionary with these keys (any may be missing if Meta did
+        not populate them for the creative type):
+        - id: Creative ID
+        - body: Primary ad text (top level - may be empty for
+            carousels and dynamic creatives, in which case look
+            inside object_story_spec or asset_feed_spec)
+        - title: Headline (top level - same caveat as body)
+        - object_story_spec: Full story specification. Common shapes:
+            - link_data: Single-image / single-video link ad. Has
+                `message` (primary text), `name` (headline),
+                `description`, `call_to_action`, `child_attachments`
+                (carousel slides, each with `name` (per-slide
+                headline), `link`, `image_hash`, `description`,
+                `call_to_action`). For carousels, also expect
+                `multi_share_end_card` and `multi_share_optimized`
+                flags.
+            - video_data: Video creative. Has `message`, `title`,
+                `call_to_action`.
+            - photo_data: Photo post creative.
+            - template_data: Catalog / dynamic product ad template.
+            - page_id: Owning Facebook Page ID.
+            - instagram_user_id: Linked Instagram account ID (when
+                the ad runs on Instagram placements).
+        - asset_feed_spec: Dynamic creative spec with parallel arrays
+            of titles, bodies, descriptions, images, videos,
+            call_to_action_types - Meta combines them at delivery.
+        - image_url: Thumbnail URL. Often null for story-spec or
+            asset-feed creatives because the real image is nested
+            inside the spec.
+
+    Where to find the actual ad copy (in priority order):
+        1. Top-level `body` / `title` - quickest hit, populated for
+           most ad types.
+        2. `object_story_spec.link_data.message` (primary text) and
+           `object_story_spec.link_data.name` (headline) - usually
+           duplicate the top-level fields but are authoritative for
+           carousels.
+        3. `object_story_spec.link_data.child_attachments[*].name` -
+           per-slide headlines for carousels.
+        4. `object_story_spec.video_data.message` / `.title` for
+           video creatives.
+        5. `asset_feed_spec.bodies[*].text` and
+           `asset_feed_spec.titles[*].text` for dynamic creatives.
+
+    Seeing the actual ad (not just text):
+        Carousel slides return an `image_hash`, not a URL. To view
+        the rendered ad, use the `preview_shareable_link` already
+        returned by `list_ads` - it is a public fb.me URL that
+        renders the whole ad (all carousel slides, the page header,
+        the CTA) exactly as it appears in feed. No auth, no
+        resolution step. Share it with the client and you are done.
+
+        For programmatic image extraction (e.g. building a deck of
+        every active creative), call the Graph API directly at
+        `/{ad_account_id}/adimages?hashes=["<hash>"]` to map hashes
+        to permanent CDN URLs.
+
+    Examples:
+        **1. Inspect copy for a single ad:**
+        ads = list_ads(account_id="act_123", campaign_id="120239...",
+                       status_filter="ACTIVE")
+        creative = get_ad_creative(creative_id=ads[0]["creative"]["id"])
+        # creative["object_story_spec"]["link_data"]["message"]
+
+        **2. Audit copy across an entire campaign:**
+        ads = list_ads(account_id="act_123", campaign_id="120239...",
+                       status_filter="ACTIVE")
+        for ad in ads:
+            c = get_ad_creative(creative_id=ad["creative"]["id"])
+            # Compare c against the brief
+
+    Note:
+        Single-resource fetch - no pagination involved.
+        Requires `ads_read` (already granted to the existing token).
+    """
+    client = _get_client()
+    return client.get_ad_creative(creative_id)
 
 
 @mcp.tool()

@@ -5,6 +5,7 @@ This module provides a client for interacting with Facebook Marketing API,
 handling authentication, pagination, and error management.
 """
 from typing import Dict, List, Any, Optional
+from datetime import datetime, timezone
 import urllib.parse
 import requests
 import json
@@ -13,6 +14,55 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+
+def _date_to_unix(date_str: str) -> int:
+    """Convert a YYYY-MM-DD string to a Unix epoch (start of day, UTC)."""
+    dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def _build_list_filters(
+    name_contains: Optional[str] = None,
+    objective: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    updated_after: Optional[str] = None,
+    extra_filters: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Compile convenience kwargs into Meta's `filtering` triple array.
+
+    Each filter is `{field, operator, value}` AND'd against the others.
+    Date strings (YYYY-MM-DD) are converted to Unix epoch (UTC start of day),
+    which is the format Meta's filtering API expects for created_time and
+    updated_time fields.
+
+    Operator notes (verified against the Marketing API, not just docs):
+    - `name`: only CONTAIN is supported across campaigns / adsets / ads.
+        STARTS_WITH returns error 100 on every list endpoint.
+    - `objective`: only IN is supported. EQUAL returns error 100.
+        We compile a single `objective` value into IN [value] for ergonomics.
+    - `created_time` / `updated_time`: GREATER_THAN / LESS_THAN with
+        Unix epoch integer values.
+
+    Returns an empty list if no filters were supplied; callers should skip
+    setting the `filtering` query param in that case.
+    """
+    filters: List[Dict[str, Any]] = []
+    if name_contains:
+        filters.append({'field': 'name', 'operator': 'CONTAIN', 'value': name_contains})
+    if objective:
+        filters.append({'field': 'objective', 'operator': 'IN', 'value': [objective]})
+    if created_after:
+        filters.append({'field': 'created_time', 'operator': 'GREATER_THAN', 'value': _date_to_unix(created_after)})
+    if created_before:
+        filters.append({'field': 'created_time', 'operator': 'LESS_THAN', 'value': _date_to_unix(created_before)})
+    if updated_after:
+        filters.append({'field': 'updated_time', 'operator': 'GREATER_THAN', 'value': _date_to_unix(updated_after)})
+    if extra_filters:
+        filters.extend(extra_filters)
+    return filters
 
 
 class FacebookAdsClient:
@@ -156,28 +206,42 @@ class FacebookAdsClient:
         self,
         account_id: str,
         effective_status: Optional[List[str]] = None,
+        name_contains: Optional[str] = None,
+        objective: Optional[str] = None,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
+        updated_after: Optional[str] = None,
+        extra_filters: Optional[List[Dict[str, Any]]] = None,
         limit: int = 100
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Retrieve all campaigns for specified ad account.
 
         Returns all campaigns automatically with pagination handled internally.
+        All filter kwargs are applied server-side (Meta's `filtering` API)
+        and AND'd together.
 
         Args:
             account_id: Facebook ad account ID (with or without 'act_' prefix)
             effective_status: Filter by campaign status (e.g., ['ACTIVE', 'PAUSED'])
+            name_contains: Server-side substring match on campaign name
+                (CASE-SENSITIVE). Only operator supported on Meta's side
+                for the name field; for prefix matching, use a leading
+                anchor in the substring.
+            objective: Filter to a single objective (e.g. 'OUTCOME_LEADS').
+                Compiled to Meta's IN operator with a one-element list
+                (Meta does not accept EQUAL on objective).
+            created_after: YYYY-MM-DD - only campaigns created strictly after
+                this date (UTC start of day).
+            created_before: YYYY-MM-DD - only campaigns created strictly before
+                this date.
+            updated_after: YYYY-MM-DD - only campaigns updated strictly after.
+            extra_filters: Escape hatch - raw Meta filter triples
+                ({field, operator, value}) AND'd with the convenience filters.
             limit: Results per page for internal batching (default: 100)
 
         Returns:
-            Dictionary containing list of all campaigns
-
-        Example:
-            >>> client = FacebookAdsClient()
-            >>> campaigns = client.get_campaigns(
-            ...     account_id='123456',
-            ...     effective_status=['ACTIVE']
-            ... )
-            >>> print(f"Found {len(campaigns['data'])} campaigns")
+            Dictionary containing list of all campaigns matching the filters.
         """
         if not account_id.startswith('act_'):
             account_id = f'act_{account_id}'
@@ -189,6 +253,17 @@ class FacebookAdsClient:
 
         if effective_status:
             params['effective_status'] = json.dumps(effective_status)
+
+        filters = _build_list_filters(
+            name_contains=name_contains,
+            objective=objective,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            extra_filters=extra_filters,
+        )
+        if filters:
+            params['filtering'] = json.dumps(filters)
 
         return self._make_paginated_request(
             f"/{account_id}/campaigns",
@@ -214,12 +289,19 @@ class FacebookAdsClient:
         campaign_id: Optional[str] = None,
         effective_status: Optional[List[str]] = None,
         fields: Optional[List[str]] = None,
+        name_contains: Optional[str] = None,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
+        updated_after: Optional[str] = None,
+        extra_filters: Optional[List[Dict[str, Any]]] = None,
         limit: int = 100
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Retrieve all ad sets for specified ad account or campaign.
 
         Returns all ad sets automatically with pagination handled internally.
+        Filter kwargs are applied server-side (Meta's `filtering` API) and
+        AND'd together.
 
         Args:
             account_id: Facebook ad account ID (with or without 'act_' prefix).
@@ -229,13 +311,19 @@ class FacebookAdsClient:
                 account_id is ignored.
             effective_status: Filter by ad set status
             fields: Override the default field list. Pass None to use
-                DEFAULT_AD_SET_FIELDS (lean, no targeting). Pass an explicit
-                list to request specific fields. Heavy fields like
+                DEFAULT_AD_SET_FIELDS (lean, no targeting). Heavy fields like
                 'targeting' can multiply response size by 10x or more.
+            name_contains: Server-side substring match (CASE-SENSITIVE).
+                Only operator supported on Meta's side for `name` -
+                STARTS_WITH is rejected with error 100.
+            created_after: YYYY-MM-DD floor on created_time.
+            created_before: YYYY-MM-DD ceiling on created_time.
+            updated_after: YYYY-MM-DD floor on updated_time.
+            extra_filters: Escape hatch - raw Meta filter triples AND'd in.
             limit: Results per page for internal batching (default: 100)
 
         Returns:
-            Dictionary containing list of all ad sets
+            Dictionary containing list of all ad sets matching the filters.
         """
         field_list = fields if fields is not None else self.DEFAULT_AD_SET_FIELDS
         params = {
@@ -245,6 +333,16 @@ class FacebookAdsClient:
 
         if effective_status:
             params['effective_status'] = json.dumps(effective_status)
+
+        filters = _build_list_filters(
+            name_contains=name_contains,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            extra_filters=extra_filters,
+        )
+        if filters:
+            params['filtering'] = json.dumps(filters)
 
         if campaign_id:
             endpoint = f"/{campaign_id}/adsets"
@@ -261,22 +359,36 @@ class FacebookAdsClient:
         campaign_id: Optional[str] = None,
         adset_id: Optional[str] = None,
         effective_status: Optional[List[str]] = None,
+        name_contains: Optional[str] = None,
+        created_after: Optional[str] = None,
+        created_before: Optional[str] = None,
+        updated_after: Optional[str] = None,
+        extra_filters: Optional[List[Dict[str, Any]]] = None,
         limit: int = 100
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Retrieve all ads for specified ad account, campaign, or ad set.
 
         Returns all ads automatically with pagination handled internally.
+        Filter kwargs are applied server-side (Meta's `filtering` API) and
+        AND'd together.
 
         Args:
             account_id: Facebook ad account ID (with or without 'act_' prefix)
-            campaign_id: Optional campaign ID to list ads for a specific campaign
-            adset_id: Optional ad set ID to list ads for a specific ad set
-            effective_status: Filter by ad status
+            campaign_id: Optional campaign ID scope.
+            adset_id: Optional ad set ID scope.
+            effective_status: Filter by ad status.
+            name_contains: Server-side substring match (CASE-SENSITIVE).
+                Only operator supported on Meta's side for `name` -
+                STARTS_WITH is rejected with error 100.
+            created_after: YYYY-MM-DD floor on created_time.
+            created_before: YYYY-MM-DD ceiling on created_time.
+            updated_after: YYYY-MM-DD floor on updated_time.
+            extra_filters: Escape hatch - raw Meta filter triples AND'd in.
             limit: Results per page for internal batching (default: 100)
 
         Returns:
-            Dictionary containing list of all ads
+            Dictionary containing list of all ads matching the filters.
         """
         params = {
             'fields': 'id,name,campaign_id,adset_id,status,effective_status,creative{id,title,body,image_url},preview_shareable_link,created_time,updated_time',
@@ -285,6 +397,16 @@ class FacebookAdsClient:
 
         if effective_status:
             params['effective_status'] = json.dumps(effective_status)
+
+        filters = _build_list_filters(
+            name_contains=name_contains,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            extra_filters=extra_filters,
+        )
+        if filters:
+            params['filtering'] = json.dumps(filters)
 
         if adset_id:
             endpoint = f"/{adset_id}/ads"
@@ -296,6 +418,34 @@ class FacebookAdsClient:
             endpoint = f"/{account_id}/ads"
 
         return self._make_paginated_request(endpoint, params=params)
+
+    def get_ad_creative(self, creative_id: str) -> Dict[str, Any]:
+        """
+        Retrieve the full AdCreative object for a given creative ID.
+
+        Single-resource fetch (not paginated). Use list_ads to discover
+        the creative_id from each ad's nested `creative.id` field.
+
+        Args:
+            creative_id: AdCreative ID (e.g. from list_ads -> creative.id)
+
+        Returns:
+            Raw API response containing the requested fields:
+            - body: Primary ad text (top level)
+            - title: Headline (top level)
+            - object_story_spec: Full story spec. For carousels,
+                link_data.child_attachments holds per-slide text.
+            - asset_feed_spec: Dynamic / flexible creative asset
+                structure (titles, bodies, images, videos as parallel
+                arrays).
+            - image_url: Thumbnail URL. Often null for story-spec or
+                asset-feed creatives since the real image is nested
+                inside the spec.
+        """
+        params = {
+            'fields': 'body,title,object_story_spec,asset_feed_spec,image_url'
+        }
+        return self._make_request(f"/{creative_id}", params=params)
 
     def get_account_insights(
         self,
