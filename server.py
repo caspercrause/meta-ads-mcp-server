@@ -1,1001 +1,1090 @@
 """
-Facebook Ads MCP Server
+Meta (Facebook) Ads MCP Server - read-only reporting.
 
-A Model Context Protocol (MCP) server for Facebook Marketing API that provides
-entity management and performance reporting capabilities with automatic pagination.
+One insights tool covers every aggregation level (account / campaign /
+adset / ad) through the `level` parameter; there are no separate
+per-level performance tools. Entity list tools cover discovery, and the
+pixel / custom conversion tools cover tracking diagnostics.
 
-Transport Method:
-    This server uses stdio (standard input/output) transport, which is the standard
-    method for MCP servers. The server communicates with clients (like Claude Desktop)
-    through stdin/stdout, making it compatible with any MCP-compliant client.
+Every tool accepts format='compact' (CSV rows plus terse key=value header
+lines, default) or format='json' (minified, null fields stripped).
+
+Transport: stdio.
 """
-from typing import List, Optional
+import csv
+import io
+import json
+from datetime import datetime
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
+
 from fastmcp import FastMCP
-from facebook_client import FacebookAdsClient, _date_to_unix
+from fastmcp.exceptions import ToolError
+from pydantic import BeforeValidator
+
+from facebook_client import FacebookAdsClient, FacebookAPIError, _date_to_unix
 from data_processor import FacebookDataProcessor
 
-# Pixel stats accepts either ISO 8601 or Unix epoch. We convert YYYY-MM-DD to
-# Unix epoch (start-of-day UTC) so the parameter behavior is unambiguous.
-# We deliberately do not allowlist aggregation values client-side: Meta keeps
-# adding new ones and a hardcoded list drifts. If the value is invalid Meta
-# returns a clear error listing the currently valid options.
+INSTRUCTIONS = """Read-only Meta (Facebook) Marketing API.
+ids: account_id comes from meta_ads_list_accounts; the act_ prefix is optional everywhere.
+Dates are YYYY-MM-DD; every date range is inclusive on both ends.
+format: 'compact' (CSV rows + key=value header lines, default) or 'json' (minified, nulls stripped).
+In compact output, lists are joined with ' ¦ '. status columns show Meta's effective_status.
+name_contains is a CASE-SENSITIVE server-side substring match (the only name operator Meta
+supports); anchor the substring for prefix-style matching. Budgets and spend are in the
+account currency; budget columns are converted from cents. Pagination is internal and results
+are complete unless a 'truncated:' line says otherwise."""
 
-# Initialize FastMCP server
-# The server will communicate using stdio transport by default
-mcp = FastMCP("Facebook Ads MCP Server")
+mcp = FastMCP("meta_ads_mcp", instructions=INSTRUCTIONS, include_fastmcp_meta=False)
 
-# Initialize client and processor (will be created per request)
+READONLY = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+
+Format = Literal["compact", "json"]
+Level = Literal["account", "campaign", "adset", "ad"]
+Status = Literal["ACTIVE", "PAUSED", "ARCHIVED", "WITH_ISSUES", "ALL"]
+AdsetStatus = Literal["ACTIVE", "PAUSED", "CAMPAIGN_PAUSED", "ARCHIVED", "WITH_ISSUES", "ALL"]
+AdStatus = Literal["ACTIVE", "PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED", "ARCHIVED",
+                   "WITH_ISSUES", "ALL"]
+Increment = Literal["total", "day", "week", "month"]
+Bucket = Literal["hour", "day", "total"]
+
+# Ids are strings in the Graph API, but clients often send them as JSON numbers.
+Id = Annotated[str, BeforeValidator(
+    lambda v: str(v) if isinstance(v, int) and not isinstance(v, bool) else v)]
+# Id-list filters also arrive as a bare scalar now and then.
+IdList = Annotated[List[Id], BeforeValidator(
+    lambda v: [v] if isinstance(v, (str, int)) and not isinstance(v, bool) else v)]
+
+SEP = " ¦ "
+MAX_INSIGHTS_ROWS = 1000
+MAX_LIST_ROWS = 500
+MAX_CREATIVE_IDS = 50
+
+DEFAULT_METRICS = ["spend", "impressions", "reach", "inline_link_clicks", "actions"]
+LEVEL_FIELDS = {
+    "account": [],
+    "campaign": ["campaign_id", "campaign_name"],
+    "adset": ["campaign_id", "adset_id", "adset_name"],
+    "ad": ["campaign_id", "adset_id", "ad_id", "ad_name"],
+}
+INCREMENTS = {"total": None, "day": "1", "week": "7", "month": "monthly"}
+
+ACCOUNT_STATUS = {
+    1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW",
+    8: "PENDING_SETTLEMENT", 9: "IN_GRACE_PERIOD", 100: "PENDING_CLOSURE", 101: "CLOSED",
+}
+
+_client: Optional[FacebookAdsClient] = None
+_processor = FacebookDataProcessor()
+
+
 def _get_client() -> FacebookAdsClient:
-    """Create Facebook Ads client instance."""
-    return FacebookAdsClient()
-
-def _get_processor() -> FacebookDataProcessor:
-    """Create data processor instance."""
-    return FacebookDataProcessor()
+    global _client
+    if _client is None:
+        _client = FacebookAdsClient()
+    return _client
 
 
-@mcp.tool()
-def list_ad_accounts() -> List[dict]:
-    """
-    List all Facebook ad accounts accessible with your access token.
+def _error_message(e: Exception) -> str:
+    if isinstance(e, FacebookAPIError):
+        code = e.code
+        if code == 190:
+            return (f"Meta access token invalid or expired (code 190): {e.message} "
+                    "Regenerate FACEBOOK_ACCESS_TOKEN.")
+        if code in (4, 17, 613, 80004):
+            return (f"Meta rate limit (code {code}) persisted after retries: {e.message} "
+                    "Wait a few minutes before retrying.")
+        if code == 100:
+            return (f"Meta rejected the request (code 100): {e.message} "
+                    "Common causes: invalid field name, unsupported filter operator "
+                    "(name supports only CONTAIN; objective only IN), or a malformed parameter.")
+        if code in (10, 200, 294):
+            return (f"Permission denied (code {code}): {e.message} "
+                    "The token lacks a required permission (ads_read; "
+                    "business_management for dataset quality).")
+        if code == 803:
+            return (f"Unknown or inaccessible object id (code 803): {e.message} "
+                    "Verify ids with the list tools.")
+        if code:
+            return f"Meta API error {code}: {e.message}"
+        return f"Meta API request failed: {e.message}"
+    return str(e)
 
-    Returns complete list of all accounts automatically - no pagination needed.
-    This tool handles pagination internally and returns ALL accounts in a single call.
-    
-    **THIS IS THE FIRST TOOL TO CALL** when working with Facebook Ads.
-    Use it to find the account_id needed for all other tools.
+
+def _parse_date(value: str, field_name: str) -> datetime:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        raise ValueError(f"{field_name} must be in YYYY-MM-DD format, got {value!r}")
+
+
+def _validate_range(start_date: str, end_date: str) -> None:
+    start_dt = _parse_date(start_date, "start_date")
+    end_dt = _parse_date(end_date, "end_date")
+    if end_dt < start_dt:
+        raise ValueError(f"end_date {end_date} is before start_date {start_date}")
+
+
+# ============================================================ rendering
+
+def _strip(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _strip(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip(v) for v in obj]
+    return obj
+
+
+def _json(data: Any) -> str:
+    return json.dumps(_strip(data), separators=(",", ":"), default=str, ensure_ascii=False)
+
+
+def _cell(v: Any) -> Any:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, list):
+        return SEP.join(
+            json.dumps(x, separators=(",", ":"), ensure_ascii=False)
+            if isinstance(x, (dict, list)) else str(x)
+            for x in v
+        )
+    if isinstance(v, dict):
+        return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+    return v
+
+
+def _csv(rows: List[Dict[str, Any]], keep: Optional[List[str]] = None) -> str:
+    """CSV of rows. Columns empty in every row are dropped unless listed in keep."""
+    cols: List[str] = list(keep or [])
+    for r in rows:
+        for k, v in r.items():
+            if k not in cols and v not in (None, [], ""):
+                cols.append(k)
+    if keep is None:
+        cols = [c for c in cols if any(r.get(c) not in (None, [], "") for r in rows)]
+    if not cols:
+        return ""
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([_cell(r.get(c)) for c in cols])
+    return buf.getvalue().rstrip("\n")
+
+
+def _lines(*parts: Optional[str]) -> str:
+    return "\n".join(p for p in parts if p)
+
+
+def _kv(d: Dict[str, Any]) -> str:
+    return " ".join(f"{k}={_cell(v)}" for k, v in d.items() if v is not None)
+
+
+def _day(ts: Any) -> Any:
+    return ts[:10] if isinstance(ts, str) else ts
+
+
+def _cents(v: Any) -> Any:
+    """Convert a Meta budget (string, in cents) to account currency units."""
+    if v in (None, ""):
+        return None
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return v
+    return n // 100 if n % 100 == 0 else n / 100
+
+
+def _act(account_id: str) -> str:
+    return account_id if account_id.startswith("act_") else f"act_{account_id}"
+
+
+def _statuses(status: str) -> Optional[List[str]]:
+    return None if status == "ALL" else [status]
+
+
+def _truncate(rows: List[Dict[str, Any]], cap: int, hint: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    if len(rows) <= cap:
+        return rows, None
+    return rows[:cap], f"truncated: showing first {cap} of {len(rows)} rows; {hint}"
+
+
+def _pages_note(response: Dict[str, Any]) -> Optional[str]:
+    if response.get("pages_truncated"):
+        return "note: the API page guard stopped pagination early; narrow the request"
+    return None
+
+
+def _render_rows(
+    label: str,
+    rows: List[Dict[str, Any]],
+    fmt: str,
+    note: Optional[str] = None,
+    truncated: Optional[str] = None,
+    keep: Optional[List[str]] = None,
+) -> str:
+    if fmt == "json":
+        out: Dict[str, Any] = {"count": len(rows), label: rows}
+        if note:
+            out["note"] = note
+        if truncated:
+            out["truncated"] = truncated
+        return _json(out)
+    body = _csv(rows, keep=keep) if rows else f"{label}: none"
+    return _lines(note, truncated, body)
+
+
+# ============================================================ entity tools
+
+@mcp.tool(name="meta_ads_list_accounts",
+          annotations={"title": "List Meta Ad Accounts", **READONLY}, output_schema=None)
+def meta_ads_list_accounts(
+    status: Literal["ACTIVE", "ALL"] = "ACTIVE",
+    name_contains: Optional[str] = None,
+    format: Format = "compact",
+) -> str:
+    """List Meta ad accounts accessible to the configured token. Start here.
+
+    Args:
+        status: 'ACTIVE' (default) or 'ALL' to include disabled and closed accounts.
+        name_contains: Substring filter on account name; applied locally,
+            case-insensitive (unlike the other list tools).
+        format: 'compact' (CSV, default) or 'json'.
 
     Returns:
-        List of ad account dictionaries with keys:
-        - id: Account ID with 'act_' prefix (e.g., "act_123456789")
-              **USE THIS** for account_id parameter in other tools
-        - account_id: Numeric account ID (without prefix)
-        - name: Account name (use to identify the right account)
-        - currency: Account currency code (e.g., "USD", "CHF", "EUR")
-        - timezone_name: Account timezone
-        - account_status: 1 = Active, 101 = Disabled
-        - business: Business object with id and name (if linked)
-
-    Examples:
-        **1. Find account by name:**
-        accounts = list_ad_accounts()
-        # Look for account named "My Company" in the results
-        # Use the 'id' field (e.g., "act_123456789") for other tools
-        
-        **2. Typical workflow:**
-        # Step 1: List accounts to find account_id
-        accounts = list_ad_accounts()
-        
-        # Step 2: Use account_id in other tools
-        # campaigns = list_campaigns(account_id="act_123456789")
-        # insights = get_account_insights(account_id="act_123456789", ...)
-    
-    Note:
-        - Pagination is handled automatically - you get ALL accounts
-        - Look for account_status=1 for active accounts
+        Rows with id (the account_id for every other tool), name, currency,
+        timezone, status, business_name.
     """
-    client = _get_client()
-    response = client.get_ad_accounts()
-    return response.get('data', [])
+    try:
+        response = _get_client().get_ad_accounts()
+        rows = []
+        for a in response.get("data", []):
+            rows.append({
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "currency": a.get("currency"),
+                "timezone": a.get("timezone_name"),
+                "status": ACCOUNT_STATUS.get(a.get("account_status"), str(a.get("account_status"))),
+                "business_name": (a.get("business") or {}).get("name"),
+            })
+        if status == "ACTIVE":
+            rows = [r for r in rows if r["status"] == "ACTIVE"]
+        if name_contains:
+            needle = name_contains.lower()
+            rows = [r for r in rows if needle in (r["name"] or "").lower()]
+        return _render_rows("accounts", rows, format, note=_pages_note(response))
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
 
 
-@mcp.tool()
-def list_campaigns(
-    account_id: str,
-    status_filter: Optional[str] = None,
+@mcp.tool(name="meta_ads_list_campaigns",
+          annotations={"title": "List Meta Campaigns", **READONLY}, output_schema=None)
+def meta_ads_list_campaigns(
+    account_id: Id,
+    status: Status = "ACTIVE",
     name_contains: Optional[str] = None,
-    objective: Optional[str] = None,
+    objective: Optional[Union[str, List[str]]] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
     updated_after: Optional[str] = None,
-    extra_filters: Optional[List[dict]] = None
-) -> List[dict]:
-    """
-    Get all campaigns for a Facebook ad account, with server-side filtering.
+    extra_filters: Optional[List[dict]] = None,
+    format: Format = "compact",
+) -> str:
+    """List campaigns in a Meta ad account with server-side filtering.
 
-    Automatically fetches all pages and returns the complete filtered list.
-    Prefer the filter kwargs over fetching everything and filtering in Python -
-    they push the work to Meta's API and dramatically shrink the response on
-    large accounts.
+    For campaign performance use meta_ads_get_insights with level='campaign'.
 
     Args:
-        account_id: Ad account ID (with or without 'act_' prefix).
-            Example: "act_123456789" or "123456789"
-        status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or
-            None for all (default).
-        name_contains: Substring of campaign name. CASE-SENSITIVE on Meta's
-            side - lowercase your pattern if names are mixed case. This is
-            the ONLY name-matching operator Meta accepts on the campaigns /
-            adsets / ads endpoints; for prefix-style matching, anchor the
-            substring (e.g. name_contains="S18 |").
-        objective: Single objective value. Compiled to Meta's IN operator
-            (Meta does not accept EQUAL on objective).
-            ODAX values: 'OUTCOME_LEADS', 'OUTCOME_SALES',
-            'OUTCOME_TRAFFIC', 'OUTCOME_AWARENESS', 'OUTCOME_ENGAGEMENT',
-            'OUTCOME_APP_PROMOTION'.
-            **CAVEAT (verified against the live API):** The objective filter
-            matches against the *original* stored value, not the ODAX-
-            normalized read value. New campaigns created with ODAX
-            objectives (e.g. OUTCOME_LEADS) match correctly. OLDER campaigns
-            created with legacy objectives (LINK_CLICKS, CONVERSIONS,
-            BRAND_AWARENESS, REACH, POST_ENGAGEMENT, LEAD_GENERATION,
-            APP_INSTALLS, ...) read back as ODAX values but only match the
-            filter when you pass the legacy name. For a mixed-vintage
-            account, prefer extra_filters with a union list, e.g.:
-            `extra_filters=[{"field": "objective", "operator": "IN",
-            "value": ["OUTCOME_TRAFFIC", "LINK_CLICKS", "TRAFFIC"]}]`.
-        created_after: YYYY-MM-DD - campaigns created strictly after this
-            date (UTC start of day).
-        created_before: YYYY-MM-DD - campaigns created strictly before.
-        updated_after: YYYY-MM-DD - campaigns updated strictly after.
-        extra_filters: Escape hatch for any Meta filter not exposed above.
-            List of {field, operator, value} dicts AND'd with the rest.
-            Example: [{"field": "daily_budget", "operator": "GREATER_THAN",
-            "value": 5000}].
-
-    Returns:
-        List of campaign dictionaries with id, name, status, effective_status,
-        objective, daily_budget, lifetime_budget, created_time, updated_time.
-
-    Examples:
-        **1. Active French-Suisse campaigns:**
-        list_campaigns(account_id="act_123", status_filter="ACTIVE",
-                       name_contains="CH | FR")
-
-        **2. Lead-objective campaigns launched this quarter:**
-        list_campaigns(account_id="act_123", objective="OUTCOME_LEADS",
-                       created_after="2026-01-01")
-
-        **3. Naming-audit by anchored substring (workaround for prefix):**
-        list_campaigns(account_id="act_123", name_contains="S18 |")
-    """
-    client = _get_client()
-    effective_status = [status_filter] if status_filter else None
-    response = client.get_campaigns(
-        account_id,
-        effective_status=effective_status,
-        name_contains=name_contains,
-        objective=objective,
-        created_after=created_after,
-        created_before=created_before,
-        updated_after=updated_after,
-        extra_filters=extra_filters,
-    )
-    return response.get('data', [])
-
-
-@mcp.tool()
-def list_ad_sets(
-    account_id: str,
-    campaign_id: Optional[str] = None,
-    status_filter: Optional[str] = None,
-    fields: Optional[List[str]] = None,
-    name_contains: Optional[str] = None,
-    created_after: Optional[str] = None,
-    created_before: Optional[str] = None,
-    updated_after: Optional[str] = None,
-    extra_filters: Optional[List[dict]] = None
-) -> List[dict]:
-    """
-    Get all ad sets for a Facebook ad account or single campaign.
-
-    !!! TOKEN BUDGET WARNING !!!
-    This tool can return VERY LARGE responses for accounts with many ad sets.
-    A single account with ~90 ad sets can produce 100,000+ characters of JSON
-    if heavy fields like 'targeting' are requested. The default field list is
-    intentionally LEAN to keep responses manageable. Use this tool freely,
-    but it is super important to scope it.
-
-    USE THIS TOOL SPARINGLY:
-    - PREFER campaign_id whenever you are working on a specific campaign
-        (QA, budget review, naming audit, pixel check, etc.). Scoping to
-        one campaign is the single biggest token reduction available; an
-        account with 90 ad sets across 20 campaigns drops to 4-5 rows per
-        call.
-    - PREFER status_filter='ACTIVE' for any current-state question;
-        archived/paused ad sets accumulate over years and can 10x your
-        result size for no benefit. Drop the filter only when you
-        specifically need historical or paused entries.
-    - DO NOT request the 'targeting' field unless you specifically need it.
-        Targeting structs are nested objects with geo, age, interests,
-        behaviours, custom audiences, etc., and are the single biggest
-        bloater of this response.
-    - If you only need pixel selection, the default fields already include
-        'promoted_object' which contains the pixel_id.
-    - If the response still exceeds the token cap, the runtime will save
-        it to disk and you will be working with a file blob, not a usable
-        list. Avoid this by being precise about which fields you need.
-
-    Automatically fetches all pages of results and returns complete list.
-
-    Args:
-        account_id: Ad account ID (with or without 'act_' prefix). Used
-            when campaign_id is not provided.
-        campaign_id: Optional campaign ID to scope ad sets to a single
-            campaign (recommended for QA workflows). Use list_campaigns()
-            first to find the campaign ID. When provided, account_id is
-            still required for symmetry but is not used.
-        status_filter: Filter by status: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all.
-            Strongly prefer 'ACTIVE' unless you have a specific reason otherwise.
-        fields: Optional override of the field list. Pass None (default) to
-            get the lean default set listed below. Pass an explicit list
-            (e.g. ['id', 'name', 'targeting']) only when you genuinely need
-            extra fields. Heavy fields you can opt into when needed:
-            - 'targeting' (HEAVY: nested geo/interest/behaviour struct)
-            - 'optimization_goal', 'billing_event', 'bid_strategy'
-            - 'attribution_spec', 'destination_type', 'pacing_type'
-            - 'start_time', 'end_time', 'budget_remaining'
-            See https://developers.facebook.com/docs/marketing-api/reference/ad-campaign/
-            for the full schema.
-        name_contains: Server-side substring match on ad set name
-            (CASE-SENSITIVE). Meta does not support prefix matching on
-            this field - anchor the substring if you want that semantic.
+        account_id: Ad account id ('act_' prefix optional).
+        status: effective_status filter, default 'ACTIVE'; 'ALL' for everything.
+        name_contains: CASE-SENSITIVE substring match on name.
+        objective: One ODAX objective (e.g. 'OUTCOME_LEADS') or a list. Legacy
+            campaigns only match their original stored objective (LINK_CLICKS,
+            CONVERSIONS, ...), so pass a union list on mixed-vintage accounts.
         created_after: YYYY-MM-DD floor on created_time.
         created_before: YYYY-MM-DD ceiling on created_time.
         updated_after: YYYY-MM-DD floor on updated_time.
-        extra_filters: Escape hatch for any Meta filter not exposed above.
-            List of {field, operator, value} dicts AND'd with the rest.
+        extra_filters: Raw Meta {field, operator, value} triples AND'd in.
+        format: 'compact' (CSV, default) or 'json'.
 
-    Returns (default field list):
-        Complete list of ad sets with keys:
-        - id: Ad set ID
-        - name: Ad set name
-        - campaign_id: Parent campaign ID (use to group ad sets by campaign
-            or to cross-reference with list_campaigns)
-        - status: Ad set status
-        - effective_status: Effective status
-        - daily_budget: Daily budget in cents
-        - lifetime_budget: Lifetime budget in cents
-        - promoted_object: What this ad set is optimizing for. Only populated
-            for objectives that require an optimization target. Common keys:
-            - pixel_id: Facebook pixel ID being fired against (use with
-                get_pixel_stats / get_pixel_health)
-            - custom_event_type: Standard event name (e.g. 'LEAD', 'PURCHASE',
-                'COMPLETE_REGISTRATION', 'OTHER')
-            - custom_event_str: Custom event string when custom_event_type='OTHER'
-            - custom_conversion_id: Custom conversion ID (use with
-                get_custom_conversion_stats)
-            - page_id: Facebook Page ID for engagement / page-promotion ad sets
-            - application_id: App ID for app-install ad sets
-            Empty/missing for awareness, reach, and other non-conversion objectives.
-        - created_time: Creation timestamp
-        - updated_time: Last update timestamp
-
-    Examples:
-        **1. QA pixel assignment for a single campaign (recommended):**
-        list_ad_sets(account_id="act_123", campaign_id="120239...", status_filter="ACTIVE")
-        # Each row's promoted_object.pixel_id tells you which pixel is selected
-        # (or empty if no pixel was assigned, which is often the bug to detect)
-
-        **2. Audit pixel usage across an entire account:**
-        list_ad_sets(account_id="act_123", status_filter="ACTIVE")
-        # Group results by promoted_object.pixel_id to see which pixels are in use
-
-        **3. Audit daily budgets across one campaign's ad sets (general use):**
-        list_ad_sets(account_id="act_123", campaign_id="120239...", status_filter="ACTIVE")
-        # Sum or compare daily_budget / lifetime_budget across the returned rows.
-        # The default field list already includes both budgets, no extra fields needed.
-
-        **4. Find ad sets recently launched (using server-side filter):**
-        list_ad_sets(account_id="act_123", status_filter="ACTIVE",
-                     created_after="2026-04-01")
-
-        **5. Naming-convention audit by anchored substring:**
-        list_ad_sets(account_id="act_123", name_contains="W18 |",
-                     status_filter="ACTIVE")
+    Returns:
+        Rows with id, name, status, objective, daily_budget, lifetime_budget
+        (account currency), created, updated.
     """
-    client = _get_client()
-    effective_status = [status_filter] if status_filter else None
-    response = client.get_ad_sets(
-        account_id,
-        campaign_id=campaign_id,
-        effective_status=effective_status,
-        fields=fields,
-        name_contains=name_contains,
-        created_after=created_after,
-        created_before=created_before,
-        updated_after=updated_after,
-        extra_filters=extra_filters,
-    )
-    return response.get('data', [])
+    try:
+        response = _get_client().get_campaigns(
+            account_id,
+            effective_status=_statuses(status),
+            name_contains=name_contains,
+            objective=objective,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            extra_filters=extra_filters,
+        )
+        rows = [{
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "status": c.get("effective_status"),
+            "objective": c.get("objective"),
+            "daily_budget": _cents(c.get("daily_budget")),
+            "lifetime_budget": _cents(c.get("lifetime_budget")),
+            "created": _day(c.get("created_time")),
+            "updated": _day(c.get("updated_time")),
+        } for c in response.get("data", [])]
+        rows, truncated = _truncate(rows, MAX_LIST_ROWS,
+                                    "narrow with status, name_contains or date filters")
+        return _render_rows("campaigns", rows, format,
+                            note=_pages_note(response), truncated=truncated)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
 
 
-@mcp.tool()
-def list_ads(
-    account_id: str,
-    campaign_id: Optional[str] = None,
-    adset_id: Optional[str] = None,
-    status_filter: Optional[str] = None,
+_ADSET_BASE_KEYS = ("id", "name", "campaign_id", "effective_status", "daily_budget",
+                    "lifetime_budget", "promoted_object", "created_time", "updated_time")
+
+
+@mcp.tool(name="meta_ads_list_adsets",
+          annotations={"title": "List Meta Ad Sets", **READONLY}, output_schema=None)
+def meta_ads_list_adsets(
+    account_id: Id,
+    campaign_id: Optional[Id] = None,
+    status: AdsetStatus = "ACTIVE",
     name_contains: Optional[str] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
     updated_after: Optional[str] = None,
-    extra_filters: Optional[List[dict]] = None
-) -> List[dict]:
-    """
-    Get all ads for a Facebook ad account, specific campaign, or specific ad set.
+    extra_fields: Optional[List[str]] = None,
+    extra_filters: Optional[List[dict]] = None,
+    format: Format = "compact",
+) -> str:
+    """List ad sets in an account or one campaign.
 
-    Automatically fetches all pages and returns the complete filtered list.
-    For large accounts (1000+ ads), ALWAYS pass at least one of campaign_id,
-    adset_id, name_contains, or a date filter - an unfiltered call can blow
-    past the response size limit.
-
-    Args:
-        account_id: Ad account ID (with or without 'act_' prefix).
-        campaign_id: Optional campaign scope. Use list_campaigns() to find IDs.
-        adset_id: Optional ad set scope. Use list_ad_sets() to find IDs.
-        status_filter: 'ACTIVE', 'PAUSED', 'ARCHIVED', or None for all.
-        name_contains: Server-side substring match on ad name (CASE-SENSITIVE).
-            Meta does not support prefix matching on this field - anchor
-            the substring if you want that semantic.
-        created_after: YYYY-MM-DD floor on created_time.
-        created_before: YYYY-MM-DD ceiling on created_time.
-        updated_after: YYYY-MM-DD floor on updated_time.
-        extra_filters: Escape hatch for any Meta filter not exposed above.
-            List of {field, operator, value} dicts AND'd with the rest.
-
-    Returns:
-        Complete list of all ads with keys:
-        - id: Ad ID
-        - name: Ad name
-        - campaign_id: Parent campaign ID (use to group ads by campaign)
-        - adset_id: Parent ad set ID (use to cross-reference with list_ad_sets,
-            e.g. to find which pixel this ad is firing against)
-        - status: Ad status
-        - effective_status: Effective status
-        - creative: Creative object with id, title, body, image_url
-        - preview_shareable_link: Public preview URL (fb.me short link) that
-              anyone can open without logging in - useful for sharing with clients
-        - created_time: Creation timestamp
-        - updated_time: Last update timestamp
-
-    Examples:
-        **1. Get all active ads for an account:**
-        list_ads(account_id="act_123456789", status_filter="ACTIVE")
-
-        **2. Get ads for a specific campaign (recommended for large accounts):**
-        list_ads(account_id="act_123456789", campaign_id="120239672137210575")
-
-        **3. Get ads for a specific ad set:**
-        list_ads(account_id="act_123456789", adset_id="120239672137220575")
-
-        **4. Workflow to get preview links for a campaign:**
-        # Step 1: Find the campaign
-        campaigns = list_campaigns(account_id="act_123456789")
-        # Step 2: Get ads with preview links
-        ads = list_ads(account_id="act_123456789", campaign_id="<campaign_id>")
-        # Step 3: Share the preview_shareable_link values with the client
-
-        **5. Find ads on a large account by name pattern (avoids dumping
-        thousands of rows):**
-        list_ads(account_id="act_123456789", status_filter="ACTIVE",
-                 name_contains="CH | FR")
-
-        **6. Ads created since the last QA review (date floor):**
-        list_ads(account_id="act_123456789", campaign_id="120239...",
-                 created_after="2026-04-22")
-    """
-    client = _get_client()
-    effective_status = [status_filter] if status_filter else None
-    response = client.get_ads(
-        account_id,
-        campaign_id=campaign_id,
-        adset_id=adset_id,
-        effective_status=effective_status,
-        name_contains=name_contains,
-        created_after=created_after,
-        created_before=created_before,
-        updated_after=updated_after,
-        extra_filters=extra_filters,
-    )
-    return response.get('data', [])
-
-
-@mcp.tool()
-def get_ad_creative(creative_id: str) -> dict:
-    """
-    Fetch the full creative details for a given ad creative ID.
-
-    Use this to verify ad copy text against client briefs without
-    opening Ads Manager. list_ads only returns the shallow creative
-    fields (title, body, image_url at the top level); the actual text
-    for carousels and dynamic creatives lives inside object_story_spec
-    and asset_feed_spec, which this tool exposes.
+    The promoted_object is flattened into pixel_id / custom_event_type /
+    custom_event_str / custom_conversion_id / page_id columns, which shows
+    what each ad set optimizes on (the pixel QA workhorse).
 
     Args:
-        creative_id: AdCreative ID. Get this from list_ads -> each
-            ad's `creative.id`.
+        account_id: Ad account id ('act_' prefix optional).
+        campaign_id: Scope to one campaign (preferred on large accounts).
+        status: effective_status filter, default 'ACTIVE'; 'ALL' for everything.
+            'PAUSED' means paused directly - ad sets paused via their campaign
+            show as CAMPAIGN_PAUSED.
+        name_contains: CASE-SENSITIVE substring match on name.
+        created_after / created_before / updated_after: YYYY-MM-DD bounds.
+        extra_fields: Extra ad set fields to append, e.g. 'optimization_goal',
+            'bid_strategy', 'start_time', 'end_time', 'targeting' (large).
+        extra_filters: Raw Meta {field, operator, value} triples AND'd in.
+        format: 'compact' (CSV, default) or 'json'.
 
     Returns:
-        Dictionary with these keys (any may be missing if Meta did
-        not populate them for the creative type):
-        - id: Creative ID
-        - body: Primary ad text (top level - may be empty for
-            carousels and dynamic creatives, in which case look
-            inside object_story_spec or asset_feed_spec)
-        - title: Headline (top level - same caveat as body)
-        - object_story_spec: Full story specification. Common shapes:
-            - link_data: Single-image / single-video link ad. Has
-                `message` (primary text), `name` (headline),
-                `description`, `call_to_action`, `child_attachments`
-                (carousel slides, each with `name` (per-slide
-                headline), `link`, `image_hash`, `description`,
-                `call_to_action`). For carousels, also expect
-                `multi_share_end_card` and `multi_share_optimized`
-                flags.
-            - video_data: Video creative. Has `message`, `title`,
-                `call_to_action`.
-            - photo_data: Photo post creative.
-            - template_data: Catalog / dynamic product ad template.
-            - page_id: Owning Facebook Page ID.
-            - instagram_user_id: Linked Instagram account ID (when
-                the ad runs on Instagram placements).
-        - asset_feed_spec: Dynamic creative spec with parallel arrays
-            of titles, bodies, descriptions, images, videos,
-            call_to_action_types - Meta combines them at delivery.
-        - image_url: Thumbnail URL. Often null for story-spec or
-            asset-feed creatives because the real image is nested
-            inside the spec.
-
-    Where to find the actual ad copy (in priority order):
-        1. Top-level `body` / `title` - quickest hit, populated for
-           most ad types.
-        2. `object_story_spec.link_data.message` (primary text) and
-           `object_story_spec.link_data.name` (headline) - usually
-           duplicate the top-level fields but are authoritative for
-           carousels.
-        3. `object_story_spec.link_data.child_attachments[*].name` -
-           per-slide headlines for carousels.
-        4. `object_story_spec.video_data.message` / `.title` for
-           video creatives.
-        5. `asset_feed_spec.bodies[*].text` and
-           `asset_feed_spec.titles[*].text` for dynamic creatives.
-
-    Seeing the actual ad (not just text):
-        Carousel slides return an `image_hash`, not a URL. To view
-        the rendered ad, use the `preview_shareable_link` already
-        returned by `list_ads` - it is a public fb.me URL that
-        renders the whole ad (all carousel slides, the page header,
-        the CTA) exactly as it appears in feed. No auth, no
-        resolution step. Share it with the client and you are done.
-
-        For programmatic image extraction (e.g. building a deck of
-        every active creative), call the Graph API directly at
-        `/{ad_account_id}/adimages?hashes=["<hash>"]` to map hashes
-        to permanent CDN URLs.
-
-    Examples:
-        **1. Inspect copy for a single ad:**
-        ads = list_ads(account_id="act_123", campaign_id="120239...",
-                       status_filter="ACTIVE")
-        creative = get_ad_creative(creative_id=ads[0]["creative"]["id"])
-        # creative["object_story_spec"]["link_data"]["message"]
-
-        **2. Audit copy across an entire campaign:**
-        ads = list_ads(account_id="act_123", campaign_id="120239...",
-                       status_filter="ACTIVE")
-        for ad in ads:
-            c = get_ad_creative(creative_id=ad["creative"]["id"])
-            # Compare c against the brief
-
-    Note:
-        Single-resource fetch - no pagination involved.
-        Requires `ads_read` (already granted to the existing token).
+        Rows with id, name, campaign_id, status, budgets (account currency),
+        the flattened promoted_object columns, created, updated.
     """
-    client = _get_client()
-    return client.get_ad_creative(creative_id)
+    try:
+        response = _get_client().get_ad_sets(
+            account_id,
+            campaign_id=campaign_id,
+            effective_status=_statuses(status),
+            extra_fields=extra_fields,
+            name_contains=name_contains,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            extra_filters=extra_filters,
+        )
+        rows = []
+        for a in response.get("data", []):
+            po = a.get("promoted_object") or {}
+            row = {
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "campaign_id": a.get("campaign_id"),
+                "status": a.get("effective_status"),
+                "daily_budget": _cents(a.get("daily_budget")),
+                "lifetime_budget": _cents(a.get("lifetime_budget")),
+                "pixel_id": po.get("pixel_id"),
+                "custom_event_type": po.get("custom_event_type"),
+                "custom_event_str": po.get("custom_event_str"),
+                "custom_conversion_id": po.get("custom_conversion_id"),
+                "page_id": po.get("page_id"),
+                "application_id": po.get("application_id"),
+                "created": _day(a.get("created_time")),
+                "updated": _day(a.get("updated_time")),
+            }
+            for k, v in a.items():
+                if k not in _ADSET_BASE_KEYS:
+                    row[k] = v
+            rows.append(row)
+        rows, truncated = _truncate(rows, MAX_LIST_ROWS,
+                                    "narrow with campaign_id, status or name_contains")
+        return _render_rows("adsets", rows, format,
+                            note=_pages_note(response), truncated=truncated)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
 
 
-@mcp.tool()
-def get_account_insights(
-    account_id: str,
+@mcp.tool(name="meta_ads_list_ads",
+          annotations={"title": "List Meta Ads", **READONLY}, output_schema=None)
+def meta_ads_list_ads(
+    account_id: Id,
+    campaign_id: Optional[Id] = None,
+    adset_id: Optional[Id] = None,
+    status: AdStatus = "ACTIVE",
+    name_contains: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    updated_after: Optional[str] = None,
+    include_copy: bool = False,
+    extra_filters: Optional[List[dict]] = None,
+    format: Format = "compact",
+) -> str:
+    """List ads in an account, campaign, or ad set.
+
+    preview_link is a public fb.me URL that renders the full ad (carousel
+    slides included) without login - ideal for sharing with clients. For the
+    complete ad copy use meta_ads_get_creatives with the creative_id values.
+
+    Args:
+        account_id: Ad account id ('act_' prefix optional).
+        campaign_id: Scope to one campaign (preferred on large accounts).
+        adset_id: Scope to one ad set (takes precedence over campaign_id).
+        status: effective_status filter, default 'ACTIVE'; 'ALL' for everything.
+            'PAUSED' means paused directly - ads paused via a parent show as
+            CAMPAIGN_PAUSED or ADSET_PAUSED.
+        name_contains: CASE-SENSITIVE substring match on name.
+        created_after / created_before / updated_after: YYYY-MM-DD bounds.
+        include_copy: Also return the creative's title and body columns.
+        extra_filters: Raw Meta {field, operator, value} triples AND'd in.
+        format: 'compact' (CSV, default) or 'json'.
+
+    Returns:
+        Rows with id, name, campaign_id, adset_id, status, creative_id,
+        preview_link, created, updated (+ title, body when include_copy).
+    """
+    try:
+        response = _get_client().get_ads(
+            account_id,
+            campaign_id=campaign_id,
+            adset_id=adset_id,
+            effective_status=_statuses(status),
+            include_copy=include_copy,
+            name_contains=name_contains,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            extra_filters=extra_filters,
+        )
+        rows = []
+        for a in response.get("data", []):
+            cr = a.get("creative") or {}
+            row = {
+                "id": a.get("id"),
+                "name": a.get("name"),
+                "campaign_id": a.get("campaign_id"),
+                "adset_id": a.get("adset_id"),
+                "status": a.get("effective_status"),
+                "creative_id": cr.get("id"),
+                "preview_link": a.get("preview_shareable_link"),
+                "created": _day(a.get("created_time")),
+                "updated": _day(a.get("updated_time")),
+            }
+            if include_copy:
+                row["title"] = cr.get("title")
+                row["body"] = cr.get("body")
+            rows.append(row)
+        rows, truncated = _truncate(rows, MAX_LIST_ROWS,
+                                    "narrow with campaign_id, adset_id, status or name_contains")
+        return _render_rows("ads", rows, format,
+                            note=_pages_note(response), truncated=truncated)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
+
+
+def _creative_rows(cid: str, c: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    def add(element: str, text: Any) -> None:
+        if text not in (None, ""):
+            rows.append({"creative_id": cid, "element": element, "text": text})
+
+    spec = c.get("object_story_spec") or {}
+    link = spec.get("link_data") or {}
+    video = spec.get("video_data") or {}
+    add("body", c.get("body") or link.get("message") or video.get("message"))
+    add("title", c.get("title") or link.get("name") or video.get("title"))
+    add("description", link.get("description") or video.get("link_description"))
+    cta = (link.get("call_to_action") or video.get("call_to_action") or {}).get("type")
+    add("cta", cta)
+    link_url = link.get("link") or ((link.get("call_to_action") or {}).get("value") or {}).get("link")
+    add("link", link_url)
+    for i, slide in enumerate(link.get("child_attachments") or [], 1):
+        add(f"slide{i}_headline", slide.get("name"))
+        add(f"slide{i}_description", slide.get("description"))
+    afs = c.get("asset_feed_spec") or {}
+    for i, b in enumerate(afs.get("bodies") or [], 1):
+        add(f"afs_body{i}", b.get("text"))
+    for i, t in enumerate(afs.get("titles") or [], 1):
+        add(f"afs_title{i}", t.get("text"))
+    for i, d in enumerate(afs.get("descriptions") or [], 1):
+        add(f"afs_description{i}", d.get("text"))
+    if afs.get("call_to_action_types"):
+        add("afs_cta", SEP.join(afs["call_to_action_types"]))
+    return rows
+
+
+@mcp.tool(name="meta_ads_get_creatives",
+          annotations={"title": "Get Meta Ad Creatives", **READONLY}, output_schema=None)
+def meta_ads_get_creatives(
+    creative_ids: IdList,
+    format: Format = "compact",
+) -> str:
+    """Fetch ad copy for up to 50 creatives in one batched call.
+
+    Compact output is one row per text element (body, title, description,
+    cta, link, per-slide carousel headlines, dynamic-creative variants).
+    json returns the raw specs (object_story_spec, asset_feed_spec,
+    image_url) for structural inspection. Carousel slides reference images
+    by image_hash; to see the rendered ad use the preview_link from
+    meta_ads_list_ads instead.
+
+    Args:
+        creative_ids: creative_id values from meta_ads_list_ads (max 50).
+            Meta rejects the whole batch if any id is invalid.
+        format: 'compact' (CSV, default) or 'json'.
+
+    Returns:
+        Rows with creative_id, element, text.
+    """
+    try:
+        creative_ids = list(dict.fromkeys(creative_ids))
+        if not creative_ids:
+            raise ValueError("creative_ids must contain at least one id")
+        if len(creative_ids) > MAX_CREATIVE_IDS:
+            raise ValueError(f"creative_ids is capped at {MAX_CREATIVE_IDS} per call; split the list")
+        response = _get_client().get_ad_creatives(creative_ids)
+        if format == "json":
+            return _json(response)
+        rows: List[Dict[str, Any]] = []
+        for cid in creative_ids:
+            rows.extend(_creative_rows(cid, response.get(cid) or {}))
+        body = _csv(rows, keep=["creative_id", "element", "text"]) if rows else "no text elements found"
+        return _lines(f"creatives={len(creative_ids)}", body)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
+
+
+# ============================================================ insights
+
+def _insights_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Sum additive numeric columns and derive UI-style ctr_pct / cpc."""
+    sums: Dict[str, float] = {}
+    for row in rows:
+        for k, v in row.items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            lk = k.lower()
+            if lk in ("reach", "frequency") or lk.endswith("_id"):
+                continue
+            # Ratios and unique counts are not additive across rows.
+            if lk.startswith("unique") or "rate" in lk:
+                continue
+            if any(t in lk for t in ("ctr", "cpc", "cpm", "cpp", "cost_per", "roas")):
+                continue
+            sums[k] = sums.get(k, 0.0) + v
+    totals: Dict[str, Any] = {
+        k: (int(v) if float(v).is_integer() else round(v, 2)) for k, v in sums.items()
+    }
+    spend = totals.get("spend")
+    impressions = totals.get("impressions")
+    link_clicks = totals.get("inline_link_clicks")
+    if impressions and link_clicks is not None:
+        totals["ctr_pct"] = round(link_clicks / impressions * 100, 2)
+    if link_clicks and spend is not None:
+        totals["cpc"] = round(spend / link_clicks, 2)
+    return totals
+
+
+@mcp.tool(name="meta_ads_get_insights",
+          annotations={"title": "Get Meta Ads Insights", **READONLY}, output_schema=None)
+def meta_ads_get_insights(
+    account_id: Id,
     start_date: str,
     end_date: str,
-    fields: List[str],
-    level: str = "account",
+    level: Level = "account",
+    metrics: Optional[List[str]] = None,
     breakdowns: Optional[List[str]] = None,
-    time_increment: Optional[str] = None,
-    campaign_ids: Optional[List[str]] = None,
-    adset_ids: Optional[List[str]] = None,
-    ad_ids: Optional[List[str]] = None,
-    flatten_actions: bool = True
-) -> List[dict]:
-    """
-    Get performance insights for a Facebook ad account.
+    time_increment: Increment = "total",
+    campaign_ids: Optional[IdList] = None,
+    adset_ids: Optional[IdList] = None,
+    ad_ids: Optional[IdList] = None,
+    action_types: Optional[List[str]] = None,
+    attribution_windows: Optional[List[str]] = None,
+    format: Format = "compact",
+) -> str:
+    """Performance reporting at any level - the single reporting tool.
 
-    Automatically fetches all pages of insights data and returns complete results.
-    This is the primary tool for retrieving performance metrics.
-    
-    **WORKFLOW FOR FILTERING BY CAMPAIGN NAME:**
-    If user wants data for campaigns matching a pattern (e.g., "CH | FR" campaigns):
-    1. First call list_campaigns(account_id) to get all campaigns with their IDs
-    2. Filter the results to find campaigns whose names match the pattern
-    3. Extract the campaign IDs from matching campaigns
-    4. Call get_account_insights with campaign_ids parameter set to those IDs
-    
-    **CALCULATING CTR AND CPC:**
-    The API returns ctr and cpc based on link clicks, which may differ from UI.
-    To match Facebook UI exactly, calculate manually:
-    - CTR = (inline_link_clicks / impressions) * 100
-    - CPC = spend / inline_link_clicks
+    level='campaign' returns one row per campaign ('adset' / 'ad' likewise);
+    id and name columns for the chosen level are added automatically, so
+    there is no separate campaign or adset performance tool to look for.
 
     Args:
-        account_id: Ad account ID (with or without 'act_' prefix)
-            Example: "act_123456789" or just "123456789"
-        start_date: Start date in YYYY-MM-DD format
-            Example: "2025-01-01"
-        end_date: End date in YYYY-MM-DD format
-            Example: "2025-01-31"
-        fields: List of metrics to retrieve. ALWAYS include the fields you need!
-            
-            **BASIC METRICS (most common):**
-            - 'spend': Total cost/spend
-            - 'impressions': Number of times ads were shown
-            - 'reach': Unique people who saw ads
-            - 'inline_link_clicks': Link clicks (use this for CTR/CPC calculations)
-            - 'clicks': All clicks (includes likes, comments, shares)
-            
-            **CALCULATED METRICS (returned by API but may differ from UI):**
-            - 'ctr': Click-through rate
-            - 'cpc': Cost per click
-            - 'cpm': Cost per 1000 impressions
-            
-            **CAMPAIGN/ADSET/AD INFO (include when level != 'account'):**
-            - 'campaign_name', 'campaign_id': Campaign details
-            - 'adset_name', 'adset_id': Ad set details
-            - 'ad_name', 'ad_id': Ad details
-            
-            **CONVERSION METRICS:**
-            - 'actions': Standard pixel events (purchases, leads, etc.)
-              Returns flattened as: action_purchase, action_lead, etc.
-            - 'action_values': Monetary values of actions
-              Returns flattened as: action_value_purchase, etc.
-            - 'conversions': Facebook Conversions API events
-              Returns: conversion_schedule_total (appointments), 
-                       conversion_find_location_total, etc.
-            - 'purchase_roas': Return on ad spend for purchases
-            
-        level: Aggregation level - MUST match what you're querying:
-            - 'account': Total account performance (no breakdown)
-            - 'campaign': Broken down by campaign (include campaign_name in fields)
-            - 'adset': Broken down by ad set (include adset_name in fields)
-            - 'ad': Broken down by individual ad (include ad_name in fields)
-            
-        breakdowns: Optional list for demographic/platform segmentation:
-            - ['age']: By age group
-            - ['gender']: By gender
-            - ['age', 'gender']: By age AND gender
-            - ['country']: By country
-            - ['publisher_platform']: By platform (Facebook, Instagram, etc.)
-
-        time_increment: Time granularity for the data:
-            - '1': Daily breakdown (one row per day)
-            - '7': Weekly breakdown
-            - 'monthly': Monthly breakdown
-            - 'all_days' or None: Total aggregation (single row, DEFAULT)
-            
-        campaign_ids: Optional list of campaign IDs to filter results.
-            **HOW TO USE:** 
-            1. Call list_campaigns() first to get campaign IDs
-            2. Filter campaigns by name pattern you need
-            3. Pass matching IDs here as a list: ["id1", "id2", "id3"]
-            This filters at API level - much more efficient than client-side filtering!
-            
-        adset_ids: Optional list of ad set IDs to filter results.
-            Same workflow as campaign_ids but for ad sets.
-            
-        ad_ids: Optional list of ad IDs to filter results.
-            Same workflow as campaign_ids but for ads.
-            
-        flatten_actions: If True (default), flattens nested action arrays.
-            - True: Returns action_purchase, action_lead as separate fields
-            - False: Returns raw actions array (rarely needed)
+        account_id: Ad account id ('act_' prefix optional).
+        start_date: YYYY-MM-DD, inclusive.
+        end_date: YYYY-MM-DD, inclusive.
+        level: 'account' (default), 'campaign', 'adset' or 'ad'.
+        metrics: Insights fields. Default: spend, impressions, reach,
+            inline_link_clicks, actions. Other common ones: clicks, frequency,
+            ctr, cpc, cpm, action_values, conversions, conversion_values,
+            purchase_roas, cost_per_action_type, video_thruplay_watched_actions.
+            'actions' flattens to action_<type> columns; registered custom
+            conversions appear as action_offsite_conversion.custom.<id>. Use
+            'conversions' instead of 'actions' for unregistered pixel events an
+            ad set optimizes on - it matches the UI Results column where
+            'actions' over-counts.
+        breakdowns: e.g. age, gender, country, region, publisher_platform,
+            platform_position, device_platform, impression_device.
+        time_increment: 'total' (default, one row per entity), 'day', 'week'
+            or 'month' (adds a date column).
+        campaign_ids / adset_ids / ad_ids: Filter to specific entities
+            (server-side; get ids from the list tools).
+        action_types: Keep only these action_types when flattening actions /
+            conversions columns (trims very wide rows).
+        attribution_windows: e.g. ['7d_click','1d_view'] adds per-window columns.
+        format: 'compact' (header + totals + CSV, default) or 'json'.
 
     Returns:
-        List of dictionaries, each containing the requested metrics.
-        
-        **EXAMPLE RESPONSE (level='campaign', time_increment='1'):**
-        [
-            {
-                "campaign_name": "Summer Sale 2025",
-                "spend": 150.50,
-                "impressions": 25000,
-                "inline_link_clicks": 450,
-                "action_purchase": 12,
-                "date_start": "2025-01-01"
-            },
-            ...
-        ]
-
-    Examples:
-        **1. Get total account performance for a date range:**
-        get_account_insights(
-            account_id="act_123456789",
-            start_date="2025-01-01",
-            end_date="2025-01-31",
-            fields=["spend", "impressions", "reach", "inline_link_clicks"],
-            level="account"
-        )
-        
-        **2. Get daily campaign breakdown:**
-        get_account_insights(
-            account_id="act_123456789",
-            start_date="2025-01-01",
-            end_date="2025-01-07",
-            fields=["campaign_name", "spend", "impressions", "inline_link_clicks"],
-            level="campaign",
-            time_increment="1"
-        )
-        
-        **3. Get data for SPECIFIC campaigns only (by ID):**
-        get_account_insights(
-            account_id="act_123456789",
-            start_date="2025-01-01",
-            end_date="2025-01-31",
-            fields=["campaign_name", "spend", "impressions"],
-            level="campaign",
-            campaign_ids=["123456789012345678", "234567890123456789"]
-        )
-        
-        **4. Get conversion data with purchases and leads:**
-        get_account_insights(
-            account_id="act_123456789",
-            start_date="2025-01-01",
-            end_date="2025-01-31",
-            fields=["spend", "impressions", "actions", "action_values", "conversions"],
-            level="account"
-        )
-        # Returns: action_purchase, action_lead, action_value_purchase, 
-        #          conversion_schedule_total, etc.
-
-    Note:
-        - Pagination is handled automatically - you get ALL results
-        - For large date ranges with daily breakdowns, expect many rows
-        - To match Facebook UI metrics, calculate CTR/CPC manually from 
-          spend, impressions, and inline_link_clicks
+        A header line, a totals line (additive metrics plus ctr_pct and cpc
+        computed UI-style from inline_link_clicks; the API's own ctr/cpc
+        count all clicks), then one CSV row per entity and period.
     """
-    client = _get_client()
-    processor = _get_processor()
+    try:
+        _validate_range(start_date, end_date)
+        metric_list = list(metrics) if metrics else list(DEFAULT_METRICS)
+        level_cols = LEVEL_FIELDS[level]
+        api_fields = level_cols + [m for m in metric_list if m not in level_cols]
 
-    response = client.get_account_insights(
-        account_id=account_id,
-        start_date=start_date,
-        end_date=end_date,
-        fields=fields,
-        level=level,
-        breakdowns=breakdowns,
-        time_increment=time_increment,
-        campaign_ids=campaign_ids,
-        adset_ids=adset_ids,
-        ad_ids=ad_ids
-    )
+        response = _get_client().get_insights(
+            account_id=account_id,
+            start_date=start_date,
+            end_date=end_date,
+            fields=api_fields,
+            level=level,
+            breakdowns=breakdowns,
+            time_increment=INCREMENTS[time_increment],
+            campaign_ids=campaign_ids,
+            adset_ids=adset_ids,
+            ad_ids=ad_ids,
+            attribution_windows=attribution_windows,
+        )
+        rows = _processor.process_insights(response, action_types=action_types)
+        rows = _processor.convert_numeric_fields(rows)
+        for row in rows:
+            if time_increment == "total":
+                row.pop("date_start", None)
+            elif "date_start" in row:
+                row["date"] = row.pop("date_start")
 
-    if flatten_actions:
-        # Flatten actions and convert numeric fields
-        flattened = processor.process_insights(response)
-        return processor.convert_numeric_fields(flattened)
-    else:
-        # Return raw data
-        return response.get('data', [])
+        totals = _insights_totals(rows) if rows else None
+        shown, truncated = _truncate(
+            rows, MAX_INSIGHTS_ROWS,
+            "narrow the date range, use time_increment='total', or filter ids (totals cover all rows)")
+        note = _pages_note(response)
+        header = {
+            "account": _act(account_id), "level": level,
+            "range": f"{start_date}..{end_date}",
+            "increment": time_increment, "rows": len(rows),
+        }
+
+        if format == "json":
+            out: Dict[str, Any] = dict(header)
+            out["row_count"] = out.pop("rows")
+            if totals:
+                out["totals"] = totals
+            if note:
+                out["note"] = note
+            if truncated:
+                out["truncated"] = truncated
+            out["rows"] = shown
+            return _json(out)
+
+        lead = list(level_cols)
+        if time_increment != "total":
+            lead.append("date")
+        if breakdowns:
+            lead.extend(breakdowns)
+        body = _csv(shown, keep=lead or None) if shown else "rows: none"
+        return _lines(
+            _kv(header),
+            note,
+            truncated,
+            f"totals: {_kv(totals)}" if totals else None,
+            body,
+        )
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
 
 
-@mcp.tool()
-def get_campaign_insights(
-    account_id: str,
-    start_date: str,
-    end_date: str,
-    fields: List[str],
-    time_increment: Optional[str] = None,
-    flatten_actions: bool = True
-) -> List[dict]:
-    """
-    Get performance insights broken down by campaign.
+# ============================================================ pixels and custom conversions
 
-    Convenience method that calls get_account_insights with level='campaign'.
-    Automatically fetches all pages and returns complete results.
+@mcp.tool(name="meta_ads_list_pixels",
+          annotations={"title": "List Meta Pixels", **READONLY}, output_schema=None)
+def meta_ads_list_pixels(
+    account_id: Id,
+    format: Format = "compact",
+) -> str:
+    """List Meta Pixels (datasets) on an ad account.
+
+    last_fired_time is the cheapest 'is this pixel alive' signal. Use the id
+    with meta_ads_get_pixel_stats and meta_ads_get_pixel_health.
 
     Args:
-        account_id: Ad account ID (with or without 'act_' prefix)
-        start_date: Start date in YYYY-MM-DD format
-        end_date: End date in YYYY-MM-DD format
-        fields: List of metrics to retrieve (should include 'campaign_name')
-        time_increment: Time granularity ('1' for daily, 'all_days' for total)
-        flatten_actions: If True, flatten 'actions' array into separate fields
+        account_id: Ad account id ('act_' prefix optional).
+        format: 'compact' (CSV, default) or 'json'.
 
     Returns:
-        Complete list of insights by campaign
-
-    Example:
-        Get campaign performance with spend and conversions for Q1 2025.
+        Rows with id, name, last_fired_time, is_unavailable, data_use_setting,
+        automatic_matching, first_party_cookies.
     """
-    return get_account_insights(
-        account_id=account_id,
-        start_date=start_date,
-        end_date=end_date,
-        fields=fields,
-        level='campaign',
-        time_increment=time_increment,
-        flatten_actions=flatten_actions
-    )
+    try:
+        response = _get_client().get_pixels(account_id)
+        rows = [{
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "last_fired_time": p.get("last_fired_time"),
+            "is_unavailable": p.get("is_unavailable"),
+            "data_use_setting": p.get("data_use_setting"),
+            "automatic_matching": p.get("enable_automatic_matching"),
+            "first_party_cookies": p.get("first_party_cookie_status"),
+        } for p in response.get("data", [])]
+        return _render_rows("pixels", rows, format, note=_pages_note(response))
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
 
 
-@mcp.tool()
-def list_pixels(account_id: str) -> List[dict]:
-    """
-    List all Meta Pixels (datasets) on a Facebook ad account.
-
-    Use this as the entry point for any pixel-related work. The returned
-    `id` is the pixel/dataset ID needed by get_pixel_stats and
-    get_pixel_health. The `last_fired_time` field is the cheapest signal
-    for "is this pixel still receiving traffic?".
-
-    Args:
-        account_id: Ad account ID (with or without 'act_' prefix)
-            Example: "act_123456789" or "123456789"
-
-    Returns:
-        List of pixel dictionaries with keys:
-        - id: Pixel/dataset ID (USE THIS for other pixel tools)
-        - name: Pixel name
-        - last_fired_time: ISO timestamp of the most recent event received
-              (None if the pixel has never fired)
-        - creation_time: ISO timestamp when the pixel was created
-        - is_unavailable: True if the pixel is no longer accessible
-        - is_created_by_business: True if owned by a Business Manager
-        - data_use_setting: 'ADVERTISING_AND_ANALYTICS' or 'ANALYTICS_ONLY'
-        - enable_automatic_matching: Whether Advanced Matching is enabled
-        - first_party_cookie_status: Cookie status string
-        - owner_ad_account: {id, name} of the owning ad account if applicable
-
-    Examples:
-        **1. Find pixels for an account:**
-        pixels = list_pixels(account_id="act_123456789")
-
-        **2. Quick health check across all pixels:**
-        pixels = list_pixels(account_id="act_123456789")
-        # Sort by last_fired_time to spot pixels that have gone quiet
-        for p in pixels:
-            print(p["name"], p.get("last_fired_time"))
-
-    Note:
-        Requires `ads_read` permission. Pagination handled internally.
-    """
-    client = _get_client()
-    response = client.get_pixels(account_id)
-    return response.get('data', [])
+_STATS_ROW_META = ("start_time", "timestamp", "end_time", "value", "count", "data", "aggregation")
 
 
-@mcp.tool()
-def get_pixel_stats(
-    pixel_id: str,
+def _roll_up_stats(raw_rows: List[Dict[str, Any]], bucket: str) -> List[Dict[str, Any]]:
+    """Aggregate Meta's hourly stat rows into day / total buckets."""
+    agg: Dict[Tuple[str, Tuple], float] = {}
+    for row in raw_rows:
+        ts = str(row.get("start_time") or row.get("timestamp") or "")
+        if bucket == "day":
+            label = ts[:10]
+        elif bucket == "hour":
+            label = ts[:13]
+        else:
+            label = ""
+        # Dimension keys may sit at row level or inside each data entry
+        # depending on the aggregation; keep both.
+        row_dims = [(k, str(v)) for k, v in row.items() if k not in _STATS_ROW_META]
+        entries = row.get("data")
+        if isinstance(entries, dict):
+            entries = [entries]
+        if not isinstance(entries, list) or not entries:
+            entries = [{"value": row.get("value", 0)}]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                entry = {"value": entry}
+            raw_val = entry.get("value", entry.get("count", 0))
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                val = 0.0
+            dims = tuple(sorted(row_dims + [
+                (k, str(v)) for k, v in entry.items() if k not in ("value", "count")
+            ]))
+            key = (label, dims)
+            agg[key] = agg.get(key, 0.0) + val
+    rows = []
+    for (label, dims), total in sorted(agg.items()):
+        row: Dict[str, Any] = {}
+        if label:
+            row["date" if bucket == "day" else "hour"] = label
+        row.update(dict(dims))
+        row["count"] = int(total) if total.is_integer() else round(total, 2)
+        rows.append(row)
+    return rows
+
+
+def _stats_window(start_date: str, end_date: str) -> Tuple[str, str]:
+    """Unix epoch window for the stats endpoints, end date inclusive."""
+    _validate_range(start_date, end_date)
+    return str(_date_to_unix(start_date)), str(_date_to_unix(end_date) + 86400)
+
+
+@mcp.tool(name="meta_ads_get_pixel_stats",
+          annotations={"title": "Get Meta Pixel Stats", **READONLY}, output_schema=None)
+def meta_ads_get_pixel_stats(
+    pixel_id: Id,
     start_date: str,
     end_date: str,
     aggregation: str = "event",
-    event: Optional[str] = None
-) -> List[dict]:
-    """
-    Get event activity stats for a Meta Pixel, bucketed by a chosen dimension.
+    event: Optional[str] = None,
+    bucket: Bucket = "day",
+    format: Format = "compact",
+) -> str:
+    """Pixel event volume bucketed by a diagnostic dimension.
 
-    This is the swiss army knife for pixel diagnostics. Pick an aggregation
-    to answer different questions:
-
-    - 'event': Volume per event type (Purchase, Lead, PageView, ...)
-    - 'pixel_fire': Browser-vs-server (CAPI) split
-    - 'host': Top firing domains - useful for spotting unauthorized fires
-    - 'browser_type' / 'device_os' / 'device_type': Traffic mix
-    - 'url' / 'url_by_rule': Top firing pages
-    - 'custom_data_field': Custom event parameter breakdowns
-    - 'match_keys' / 'had_pii': Advanced Matching diagnostics
-    - 'event_detection_method' / 'event_source' / 'event_processing_results':
-      Pipeline diagnostics
-    - 'event_value_count' / 'event_total_counts': Aggregate event volume
+    Aggregations answer different questions: 'event' (volume per event type),
+    'pixel_fire' (browser vs CAPI split), 'host' (firing domains, spots
+    unauthorized fires), 'url', 'browser_type', 'device_os', 'device_type',
+    'custom_data_field'. An invalid value makes Meta list the current options.
 
     Args:
-        pixel_id: Pixel/dataset ID (use list_pixels first to get this)
-        start_date: Start date in YYYY-MM-DD format (UTC)
-        end_date: End date in YYYY-MM-DD format (UTC)
-        aggregation: Dimension to bucket by. Common values: 'event',
-            'pixel_fire', 'host', 'browser_type', 'device_os', 'device_type',
-            'url', 'custom_data_field' (default: 'event'). If you pass an
-            invalid value, Meta returns an error listing the currently
-            supported options.
-        event: Optional event name to filter to (e.g. 'Purchase', 'Lead').
-            Only meaningful when combined with non-event aggregations.
+        pixel_id: Pixel id (from meta_ads_list_pixels).
+        start_date / end_date: YYYY-MM-DD, inclusive (UTC).
+        aggregation: Dimension to bucket by (default 'event').
+        event: Optional event name filter (e.g. 'Purchase', 'Lead').
+        bucket: 'day' (default; Meta's raw data is hourly and is rolled up),
+            'hour' for raw granularity, 'total' for one row per dimension value.
+        format: 'compact' (CSV, default) or 'json'.
 
     Returns:
-        List of stat-row dictionaries. Each row typically contains:
-        - start_time: Bucket start time
-        - value: Numeric count for the bucket
-        - data: Bucketed dimension breakdown (shape depends on aggregation)
-
-    Note:
-        Facebook returns this data at HOURLY granularity by default. A
-        7-day window will return ~168 rows per dimension value. For
-        wider date ranges, prefer narrow windows or aggregate the
-        returned rows by date client-side.
-
-    Examples:
-        **1. Event volume for the last 7 days:**
-        get_pixel_stats(
-            pixel_id="123456789",
-            start_date="2026-04-14",
-            end_date="2026-04-21",
-            aggregation="event"
-        )
-
-        **2. CAPI vs browser fire split for purchases:**
-        get_pixel_stats(
-            pixel_id="123456789",
-            start_date="2026-04-01",
-            end_date="2026-04-21",
-            aggregation="pixel_fire",
-            event="Purchase"
-        )
-
-        **3. Find unauthorized domains firing the pixel:**
-        get_pixel_stats(
-            pixel_id="123456789",
-            start_date="2026-04-14",
-            end_date="2026-04-21",
-            aggregation="host"
-        )
-
+        Rows with date (per bucket), the aggregation dimension columns, count.
     """
-    client = _get_client()
-    response = client.get_pixel_stats(
-        pixel_id=pixel_id,
-        start_time=str(_date_to_unix(start_date)),
-        end_time=str(_date_to_unix(end_date)),
-        aggregation=aggregation,
-        event=event
-    )
-    return response.get('data', [])
+    try:
+        start_ts, end_ts = _stats_window(start_date, end_date)
+        response = _get_client().get_pixel_stats(
+            pixel_id=pixel_id, start_time=start_ts, end_time=end_ts,
+            aggregation=aggregation, event=event,
+        )
+        rows = _roll_up_stats(response.get("data", []), bucket)
+        header = _kv({"pixel": pixel_id, "aggregation": aggregation,
+                      "range": f"{start_date}..{end_date}", "bucket": bucket,
+                      "rows": len(rows)})
+        shown, truncated = _truncate(rows, MAX_INSIGHTS_ROWS,
+                                     "narrow the date range or use bucket='day'/'total'")
+        note = _pages_note(response)
+        if format == "json":
+            out: Dict[str, Any] = {"pixel": pixel_id, "aggregation": aggregation,
+                                   "bucket": bucket, "row_count": len(rows)}
+            if note:
+                out["note"] = note
+            if truncated:
+                out["truncated"] = truncated
+            out["rows"] = shown
+            return _json(out)
+        return _lines(header, note, truncated,
+                      _csv(shown) if shown else "rows: none")
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
 
 
-@mcp.tool()
-def list_custom_conversions(account_id: str) -> List[dict]:
-    """
-    List all custom conversions for a Facebook ad account.
+@mcp.tool(name="meta_ads_get_pixel_health",
+          annotations={"title": "Get Meta Pixel Health", **READONLY}, output_schema=None)
+def meta_ads_get_pixel_health(
+    pixel_id: Id,
+    format: Format = "compact",
+) -> str:
+    """Composite pixel health snapshot: diagnostic checks plus quality fields.
 
-    Custom conversions are what most campaigns optimize against, so the
-    `last_fired_time` field is often the fastest way to detect a broken
-    tracking setup. The `event_source_id` field tells you which pixel
-    each custom conversion is attached to.
+    Compact output shows a summary line, the PASS/WARN/FAIL counts and only
+    the non-PASS checks. The dataset-quality part may need business_management
+    permission; when it fails the checks are still returned and the error is
+    reported inline (graceful degradation, not a tool error).
 
     Args:
-        account_id: Ad account ID (with or without 'act_' prefix)
+        pixel_id: Pixel id (from meta_ads_list_pixels).
+        format: 'compact' (default) or 'json' (full check list).
 
     Returns:
-        List of custom conversion dictionaries with keys:
-        - id: Custom conversion ID (use for get_custom_conversion_stats)
-        - name: Display name
-        - description: Optional description
-        - custom_event_type: PURCHASE, LEAD, ADD_TO_CART, OTHER, ...
-        - rule: JSON rule string used to match incoming events
-        - event_source_id: Linked pixel ID
-        - first_fired_time: First time this conversion fired (ISO timestamp)
-        - last_fired_time: Most recent fire (ISO timestamp). None if it has
-              never fired - usually indicates a broken setup.
-        - is_archived: True if archived
-        - is_unavailable: True if no longer accessible
-        - retention_days: Days events are retained (typically 28-90)
-        - default_conversion_value: Default monetary value
-        - creation_time: ISO timestamp when the conversion was created
-
-    Note:
-        Facebook caps custom conversions at 100 per ad account.
-        Pagination handled internally.
+        Summary line, check counts, CSV of non-PASS checks, any partial errors.
     """
-    client = _get_client()
-    response = client.get_custom_conversions(account_id)
-    return response.get('data', [])
+    try:
+        client = _get_client()
+        da_checks: Optional[List[Dict[str, Any]]] = None
+        da_error: Optional[str] = None
+        quality: Optional[Dict[str, Any]] = None
+        quality_error: Optional[str] = None
+        try:
+            da_checks = client.get_pixel_da_checks(pixel_id).get("data", [])
+        except Exception as e:
+            da_error = _error_message(e)
+        try:
+            quality = client.get_pixel_dataset_quality(pixel_id)
+        except Exception as e:
+            quality_error = _error_message(e)
+
+        if format == "json":
+            return _json({
+                "pixel_id": pixel_id,
+                "da_checks": da_checks,
+                "da_checks_error": da_error,
+                "dataset_quality": quality,
+                "dataset_quality_error": quality_error,
+            })
+
+        summary: Dict[str, Any] = {"pixel": pixel_id}
+        if quality:
+            summary.update({
+                "name": quality.get("name"),
+                "last_fired": quality.get("last_fired_time"),
+                "automatic_matching": quality.get("enable_automatic_matching"),
+                "matching_fields": quality.get("automatic_matching_fields"),
+                "cookies": quality.get("first_party_cookie_status"),
+                "data_use": quality.get("data_use_setting"),
+            })
+        parts: List[Optional[str]] = [_kv(summary)]
+        if da_checks is not None:
+            counts: Dict[str, int] = {}
+            non_pass = []
+            for check in da_checks:
+                result = str(check.get("result", "UNKNOWN")).upper()
+                counts[result] = counts.get(result, 0) + 1
+                if result != "PASS":
+                    non_pass.append({
+                        "result": result,
+                        "check": check.get("key"),
+                        "message": (check.get("user_message") or check.get("title")
+                                    or check.get("description")),
+                    })
+            parts.append("checks: " + _kv(counts) if counts else "checks: none returned")
+            parts.append(_csv(non_pass) if non_pass else
+                         ("all checks passed" if counts else None))
+        if da_error:
+            parts.append(f"da_checks_error: {da_error}")
+        if quality_error:
+            parts.append(f"dataset_quality_error: {quality_error}")
+        return _lines(*parts)
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
 
 
-@mcp.tool()
-def get_custom_conversion_stats(
-    custom_conversion_id: str,
+@mcp.tool(name="meta_ads_list_custom_conversions",
+          annotations={"title": "List Meta Custom Conversions", **READONLY}, output_schema=None)
+def meta_ads_list_custom_conversions(
+    account_id: Id,
+    include_archived: bool = False,
+    include_rule: bool = False,
+    format: Format = "compact",
+) -> str:
+    """List custom conversions on an ad account (Meta caps them at 100).
+
+    last_fired_time of None usually means a broken setup - this is the
+    fastest tracking health check. pixel_id links each conversion to its
+    source pixel.
+
+    Args:
+        account_id: Ad account id ('act_' prefix optional).
+        include_archived: Include archived conversions (default False).
+        include_rule: Add the matching rule JSON and description columns.
+        format: 'compact' (CSV, default) or 'json'.
+
+    Returns:
+        Rows with id, name, custom_event_type, pixel_id, first_fired_time,
+        last_fired_time, retention_days, default_conversion_value.
+    """
+    try:
+        response = _get_client().get_custom_conversions(account_id)
+        rows = []
+        for c in response.get("data", []):
+            if not include_archived and c.get("is_archived"):
+                continue
+            row = {
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "custom_event_type": c.get("custom_event_type"),
+                "pixel_id": c.get("event_source_id"),
+                "first_fired_time": _day(c.get("first_fired_time")),
+                "last_fired_time": c.get("last_fired_time"),
+                "retention_days": c.get("retention_days"),
+                "default_conversion_value": c.get("default_conversion_value"),
+                "is_unavailable": c.get("is_unavailable"),
+            }
+            if include_archived:
+                row["is_archived"] = c.get("is_archived")
+            if include_rule:
+                row["rule"] = c.get("rule")
+                row["description"] = c.get("description")
+            rows.append(row)
+        return _render_rows("custom_conversions", rows, format, note=_pages_note(response))
+    except ToolError:
+        raise
+    except Exception as e:
+        raise ToolError(_error_message(e)) from e
+
+
+@mcp.tool(name="meta_ads_get_custom_conversion_stats",
+          annotations={"title": "Get Meta Custom Conversion Stats", **READONLY}, output_schema=None)
+def meta_ads_get_custom_conversion_stats(
+    custom_conversion_id: Id,
     start_date: str,
     end_date: str,
-    aggregation: str = "count"
-) -> List[dict]:
-    """
-    Get fire-volume stats for a single custom conversion over a date range.
-
-    Use this to verify a custom conversion is firing as expected, or to
-    chart its volume over time independent of any campaign attribution.
+    aggregation: str = "count",
+    bucket: Bucket = "day",
+    format: Format = "compact",
+) -> str:
+    """Fire-volume stats for one custom conversion, independent of attribution.
 
     Args:
-        custom_conversion_id: Custom conversion ID (from list_custom_conversions)
-        start_date: Start date in YYYY-MM-DD format (UTC)
-        end_date: End date in YYYY-MM-DD format (UTC)
-        aggregation: Aggregation mode. One of: 'count' (fire count),
-            'usd_amount' (monetary value), 'unmatched_count',
-            'unmatched_usd_amount', 'device_type', 'host', 'pixel_fire',
-            'url' (default: 'count'). If invalid, Meta returns an error
-            listing the currently supported options.
+        custom_conversion_id: Id from meta_ads_list_custom_conversions.
+        start_date / end_date: YYYY-MM-DD, inclusive (UTC).
+        aggregation: 'count' (default), 'usd_amount', 'unmatched_count',
+            'unmatched_usd_amount', 'device_type', 'host', 'pixel_fire', 'url'.
+            An invalid value makes Meta list the current options.
+        bucket: 'day' (default; raw hourly data is rolled up), 'hour', 'total'.
+        format: 'compact' (CSV, default) or 'json'.
 
     Returns:
-        List of stat-row dictionaries. Typical shape:
-        - timestamp: Bucket start time
-        - data: Aggregated value(s) for the bucket
-
-    Note:
-        Facebook returns this data at HOURLY granularity by default. A
-        7-day window can return 100+ rows. Aggregate the returned rows
-        by date client-side if you need a daily view.
+        Rows with date (per bucket), any dimension columns, count.
     """
-    client = _get_client()
-    response = client.get_custom_conversion_stats(
-        custom_conversion_id=custom_conversion_id,
-        start_time=str(_date_to_unix(start_date)),
-        end_time=str(_date_to_unix(end_date)),
-        aggregation=aggregation
-    )
-    return response.get('data', [])
-
-
-@mcp.tool()
-def get_pixel_health(pixel_id: str) -> dict:
-    """
-    Get a composite health snapshot for a Meta Pixel.
-
-    Combines two diagnostic surfaces:
-    - `da_checks`: Per-rule diagnostic checks with PASS/WARN/FAIL results
-    - Dataset-quality fields: Event Match Quality summary, automatic
-      matching fields, last fired time
-
-    The dataset-quality portion may require additional permissions
-    (`business_management`) and a System User token. If that call fails,
-    only `da_checks` is returned and `dataset_quality_error` describes the
-    failure - the tool degrades gracefully rather than erroring out.
-
-    Args:
-        pixel_id: Pixel/dataset ID
-
-    Returns:
-        Dictionary with keys:
-        - pixel_id: The input pixel ID
-        - da_checks: List of DACheck objects (key, description, result, ...).
-              None if the diagnostics call failed.
-        - da_checks_error: Error string if da_checks failed, else None.
-        - dataset_quality: Dict of quality fields (last_fired_time,
-              aggregated_event_match_quality_summary, ...).
-              None if the quality call failed (often a permissions issue).
-        - dataset_quality_error: Error string if quality failed, else None.
-
-    Examples:
-        **1. Quick health check on a pixel:**
-        health = get_pixel_health(pixel_id="123456789")
-        if health["da_checks"]:
-            failed = [c for c in health["da_checks"]
-                      if c.get("result") == "FAIL"]
-            print(f"{len(failed)} failed diagnostic checks")
-    """
-    client = _get_client()
-    result: dict = {
-        'pixel_id': pixel_id,
-        'da_checks': None,
-        'da_checks_error': None,
-        'dataset_quality': None,
-        'dataset_quality_error': None,
-    }
-
     try:
-        da_response = client.get_pixel_da_checks(pixel_id)
-        result['da_checks'] = da_response.get('data', [])
+        start_ts, end_ts = _stats_window(start_date, end_date)
+        response = _get_client().get_custom_conversion_stats(
+            custom_conversion_id=custom_conversion_id,
+            start_time=start_ts, end_time=end_ts, aggregation=aggregation,
+        )
+        rows = _roll_up_stats(response.get("data", []), bucket)
+        header = _kv({"custom_conversion": custom_conversion_id,
+                      "aggregation": aggregation,
+                      "range": f"{start_date}..{end_date}", "bucket": bucket,
+                      "rows": len(rows)})
+        shown, truncated = _truncate(rows, MAX_INSIGHTS_ROWS,
+                                     "narrow the date range or use bucket='day'/'total'")
+        note = _pages_note(response)
+        if format == "json":
+            out: Dict[str, Any] = {"custom_conversion": custom_conversion_id,
+                                   "aggregation": aggregation, "bucket": bucket,
+                                   "row_count": len(rows)}
+            if note:
+                out["note"] = note
+            if truncated:
+                out["truncated"] = truncated
+            out["rows"] = shown
+            return _json(out)
+        return _lines(header, note, truncated,
+                      _csv(shown) if shown else "rows: none")
+    except ToolError:
+        raise
     except Exception as e:
-        result['da_checks_error'] = str(e)
-
-    try:
-        result['dataset_quality'] = client.get_pixel_dataset_quality(pixel_id)
-    except Exception as e:
-        result['dataset_quality_error'] = str(e)
-
-    return result
+        raise ToolError(_error_message(e)) from e
 
 
-# Run the server
 if __name__ == "__main__":
-    # Run server using stdio transport (standard input/output)
-    # This is the standard MCP transport method for Claude Desktop and other clients
     mcp.run(transport="stdio")

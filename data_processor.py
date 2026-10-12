@@ -1,250 +1,148 @@
 """
-Facebook Data Processor for transforming API responses.
+Flattens Meta insights responses into flat dicts with proper numeric types.
 
-This module handles flattening of complex Facebook API responses,
-particularly actions, action_values, conversions, and nested structures.
+Meta returns actions, conversions, ROAS and cost-per-action data as nested
+lists of {action_type, value} objects and most numbers as strings. This
+module flattens those structures into simple columns and converts numeric
+strings to int/float while protecting ids, names and dates.
 """
-from typing import Dict, List, Any, Optional
+import re
+from typing import Any, Dict, List, Optional
+
+# Attribution-window keys Meta attaches to action/conversion entries when
+# action_attribution_windows is requested.
+ATTRIBUTION_WINDOWS = ('7d_click', '28d_click', '1d_click', '7d_view', '1d_view', '28d_view')
+
+# Column prefixes for the canonical action-shaped fields. Any other field
+# whose value is a list of {action_type, value} entries (purchase_roas,
+# cost_per_action_type, video_p25_watched_actions, ...) is flattened with
+# the field name itself as prefix.
+_PREFIX = {
+    'actions': 'action',
+    'action_values': 'action_value',
+    'conversions': 'conversion',
+    'conversion_values': 'conversion_value',
+}
+
+# Zero-padded strings ('02134') are codes, not numbers; leave them alone.
+_INT_RE = re.compile(r'-?(0|[1-9]\d*)')
+_FLOAT_RE = re.compile(r'-?\d+\.\d+')
+
+
+def _is_action_list(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(e, dict) and 'action_type' in e for e in value)
+    )
 
 
 class FacebookDataProcessor:
-    """
-    Processes Facebook API responses into clean, flat JSON structures.
-
-    Facebook returns complex nested structures for actions and conversions.
-    This processor flattens them into simple key-value pairs suitable for
-    JSON serialization and MCP tool responses.
-    """
+    """Processes Meta API insights responses into flat, typed dicts."""
 
     def flatten_insights(
         self,
         item: Dict[str, Any],
         action_types: Optional[List[str]] = None,
-        action_value_types: Optional[List[str]] = None,
-        conversion_types: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
-        Flatten Facebook insights data including actions and conversions.
+        Flatten one insights row.
 
-        Transforms nested structures like:
-            {'actions': [{'action_type': 'purchase', 'value': '5'}]}
-        Into flat structure:
-            {'action_purchase': '5'}
+        {'actions': [{'action_type': 'lead', 'value': '5'}]} becomes
+        {'action_lead': '5'}. The same applies to action_values,
+        conversions, conversion_values, and any other list of
+        {action_type, value} entries (purchase_roas, cost_per_action_type,
+        video metrics, ...). Attribution-window keys present on an entry
+        become additional <column>_<window> fields. date_stop is dropped
+        as redundant with date_start.
+
+        'actions' vs 'conversions' - when to use which:
+        - 'actions' with offsite_conversion.custom.<id> types covers custom
+          conversions REGISTERED in Events Manager (exact counts).
+        - 'conversions' covers unregistered pixel events an ad set optimizes
+          on (e.g. fb_pixel_custom.*). Querying 'actions' for those returns
+          ALL custom pixel fires and over-counts versus the UI Results
+          column; 'conversions' matches the UI. It can arrive as a list or
+          as a dict, so both shapes are handled.
 
         Args:
-            item: Single insights data item from Facebook API
-            action_types: Specific action types to extract (None = extract all)
-            action_value_types: Specific action value types to extract (None = extract all)
-            conversion_types: Specific conversion types to extract (None = extract all)
-
-        Returns:
-            Flattened dictionary with simple key-value pairs
-
-        Example:
-            >>> processor = FacebookDataProcessor()
-            >>> raw_item = {
-            ...     'campaign_name': 'My Campaign',
-            ...     'spend': '100.50',
-            ...     'actions': [
-            ...         {'action_type': 'purchase', 'value': '5'},
-            ...         {'action_type': 'lead', 'value': '12'}
-            ...     ]
-            ... }
-            >>> flat = processor.flatten_insights(raw_item)
-            >>> print(flat)
-            {'campaign_name': 'My Campaign', 'spend': '100.50',
-             'action_purchase': '5', 'action_lead': '12'}
+            item: Single insights row from the API
+            action_types: When given, only these action_types are kept while
+                flattening actions / action_values / conversions /
+                conversion_values. Other action-shaped fields are unaffected.
         """
         flat: Dict[str, Any] = {}
-
-        # 'actions' vs 'conversions' - when to use which:
-        #
-        # 'actions' + specific custom conversion IDs (e.g. offsite_conversion.custom.123456789):
-        #   Use when custom conversions are REGISTERED in Events Manager.
-        #   Each registered conversion has a unique ID, so actions returns an exact count.
-        #   Supports action_attribution_windows for click/view split natively.
-        #
-        # 'conversions' + goal-based types (e.g. fb_pixel_custom.all_types_of_leads):
-        #   Use when custom conversions are NOT registered in Events Manager,
-        #   but GTM tags are firing and visible in the pixel. The ad set can still
-        #   optimize on these events (e.g. all_types_of_leads), but without registered
-        #   IDs there's no specific action type to filter on.
-        #   Querying 'actions' with fb_pixel_custom returns ALL custom pixel fires,
-        #   which over-counts vs the UI. The 'conversions' field returns only events
-        #   matching the ad set's optimization goal, matching the UI "Results" column.
-        #   Also supports action_attribution_windows for click/view split.
-
         for key, value in item.items():
-            if key == 'actions' and isinstance(value, list):
-                # Flatten actions array into separate fields
-                for action in value:
-                    action_type = action.get('action_type', 'unknown')
-                    action_val = action.get('value', 0)
+            if key == 'date_stop':
+                continue
 
-                    # Filter if action_types specified
-                    if action_types is None or action_type in action_types:
-                        flat[f'action_{action_type}'] = action_val
+            if _is_action_list(value):
+                prefix = _PREFIX.get(key, key)
+                filtered = key in _PREFIX and action_types is not None
+                for entry in value:
+                    entry_type = entry.get('action_type', 'unknown')
+                    if filtered and entry_type not in action_types:
+                        continue
+                    flat[f'{prefix}_{entry_type}'] = entry.get('value', 0)
+                    for window in ATTRIBUTION_WINDOWS:
+                        if window in entry:
+                            flat[f'{prefix}_{entry_type}_{window}'] = entry[window]
 
-            elif key == 'action_values' and isinstance(value, list):
-                # Flatten action values array into separate fields
-                for action in value:
-                    action_type = action.get('action_type', 'unknown')
-                    action_val = action.get('value', 0)
-
-                    # Filter if action_value_types specified
-                    if action_value_types is None or action_type in action_value_types:
-                        flat[f'action_value_{action_type}'] = action_val
-
-            elif key == 'conversions' and isinstance(value, (list, dict)):
-                # Flatten conversions - can be either list or dict depending on API response
-                if isinstance(value, list):
-                    # List format: [{'action_type': 'schedule_total', 'value': '296'}]
-                    for conversion in value:
-                        conv_type = conversion.get('action_type', 'unknown')
-                        conv_val = conversion.get('value', 0)
-
-                        # Filter if conversion_types specified
-                        if conversion_types is None or conv_type in conversion_types:
-                            flat[f'conversion_{conv_type}'] = conv_val
-                            # Extract windowed values (7d_click, 1d_view) if present
-                            for window in ['7d_click', '1d_view', '28d_click', '1d_click']:
-                                if window in conversion:
-                                    flat[f'conversion_{conv_type}_{window}'] = conversion[window]
-                else:
-                    # Dict format: {'schedule_total': '296', 'find_location_total': '1449'}
-                    # This is the actual format returned by Facebook API
-                    for conv_type, conv_val in value.items():
-                        # Filter if conversion_types specified
-                        if conversion_types is None or conv_type in conversion_types:
-                            flat[f'conversion_{conv_type}'] = conv_val
-
-            elif key == 'conversion_values' and isinstance(value, (list, dict)):
-                # Flatten conversion values - can be either list or dict
-                if isinstance(value, list):
-                    # List format
-                    for conversion in value:
-                        conv_type = conversion.get('action_type', 'unknown')
-                        conv_val = conversion.get('value', 0)
-
-                        # Use same filter as conversion_types
-                        if conversion_types is None or conv_type in conversion_types:
-                            flat[f'conversion_value_{conv_type}'] = conv_val
-                else:
-                    # Dict format
-                    for conv_type, conv_val in value.items():
-                        # Use same filter as conversion_types
-                        if conversion_types is None or conv_type in conversion_types:
-                            flat[f'conversion_value_{conv_type}'] = conv_val
-
-            elif key == 'video_thruplay_watched_actions' and isinstance(value, list):
-                # Flatten video metrics
-                for video_action in value:
-                    video_action_type = video_action.get('action_type', 'unknown')
-                    video_val = video_action.get('value', 0)
-                    flat[f'video_thruplay_watched_actions_{video_action_type}'] = video_val
+            elif key in ('conversions', 'conversion_values') and isinstance(value, dict):
+                prefix = _PREFIX[key]
+                for conv_type, conv_val in value.items():
+                    if action_types is None or conv_type in action_types:
+                        flat[f'{prefix}_{conv_type}'] = conv_val
 
             elif isinstance(value, dict):
-                # Flatten nested dicts (like creative object)
                 for sub_key, sub_value in value.items():
                     flat[f'{key}_{sub_key}'] = sub_value
 
             else:
-                # Skip date_stop as it's redundant
-                if key == 'date_stop':
-                    continue
                 flat[key] = value
-
         return flat
 
     def process_insights(
         self,
         response: Dict[str, Any],
         action_types: Optional[List[str]] = None,
-        action_value_types: Optional[List[str]] = None,
-        conversion_types: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Process insights response into list of flattened dicts.
+        """Flatten every row of an insights response."""
+        return [
+            self.flatten_insights(item, action_types=action_types)
+            for item in response.get('data', [])
+        ]
 
-        Args:
-            response: Response from Facebook API with 'data' key
-            action_types: Specific action types to extract
-            action_value_types: Specific action value types to extract
-            conversion_types: Specific conversion types to extract
-
-        Returns:
-            List of flattened insight dictionaries
-
-        Example:
-            >>> processor = FacebookDataProcessor()
-            >>> response = {
-            ...     'data': [
-            ...         {'campaign_name': 'Campaign 1', 'spend': '100',
-            ...          'actions': [{'action_type': 'purchase', 'value': '5'}]},
-            ...         {'campaign_name': 'Campaign 2', 'spend': '200',
-            ...          'actions': [{'action_type': 'purchase', 'value': '8'}]}
-            ...     ]
-            ... }
-            >>> result = processor.process_insights(response)
-            >>> print(len(result))
-            2
-        """
-        data = response.get('data', [])
-
-        if not data:
-            return []
-
-        # Flatten each item
-        flat_data = []
-        for item in data:
-            flat_item = self.flatten_insights(
-                item,
-                action_types=action_types,
-                action_value_types=action_value_types,
-                conversion_types=conversion_types
-            )
-            flat_data.append(flat_item)
-
-        return flat_data
+    @staticmethod
+    def _is_textual(key: str) -> bool:
+        """Fields that must never be converted to numbers (ids lose precision)."""
+        return (
+            key == 'id'
+            or key.endswith('_id')
+            or 'name' in key
+            or key.startswith('date')
+            or key == 'dma'
+        )
 
     def convert_numeric_fields(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Convert numeric string fields to appropriate types.
+        Convert numeric strings to int/float.
 
-        Facebook returns most numeric values as strings. This method
-        attempts to convert them to numbers for easier processing.
-
-        Args:
-            data: List of dictionaries to process
-
-        Returns:
-            List of dictionaries with numeric fields converted
-
-        Note:
-            Fields that fail conversion remain as strings.
+        Integers stay integers (no trailing .0); ids, names, dates and DMA
+        codes are left as strings.
         """
-        numeric_patterns = [
-            'spend', 'impressions', 'clicks', 'reach', 'frequency',
-            'ctr', 'cpc', 'cpm', 'conversions', 'cost', 'action_',
-            'value', 'video', 'budget'
-        ]
-
         result = []
         for item in data:
-            converted = {}
+            converted: Dict[str, Any] = {}
             for key, value in item.items():
-                # Check if field matches numeric patterns
-                if any(pattern in key.lower() for pattern in numeric_patterns):
-                    try:
-                        # Try to convert to float
-                        if isinstance(value, str):
-                            converted[key] = float(value)
-                        else:
-                            converted[key] = value
-                    except (ValueError, TypeError):
+                if isinstance(value, str) and not self._is_textual(key):
+                    if _INT_RE.fullmatch(value):
+                        converted[key] = int(value)
+                    elif _FLOAT_RE.fullmatch(value):
+                        converted[key] = float(value)
+                    else:
                         converted[key] = value
                 else:
                     converted[key] = value
             result.append(converted)
-
         return result
