@@ -104,14 +104,17 @@ INSIGHTS = {
     ],
 }
 
+# Live /stats shape: `value` is the dimension label (the event name here)
+# and `count` is the number. Treating `value` as the number is the bug that
+# zeroed every row in production.
 PIXEL_STATS = {
     'data': [
         {'start_time': '2026-04-14T03:00:00+0000',
-         'data': [{'value': '5', 'event': 'Lead'}, {'value': '90', 'event': 'PageView'}]},
+         'data': [{'value': 'Lead', 'count': 5}, {'value': 'PageView', 'count': 90}]},
         {'start_time': '2026-04-14T04:00:00+0000',
-         'data': [{'value': '3', 'event': 'Lead'}]},
+         'data': [{'value': 'Lead', 'count': 3}]},
         {'start_time': '2026-04-15T03:00:00+0000',
-         'data': [{'value': '2', 'event': 'Lead'}]},
+         'data': [{'value': 'Lead', 'count': 2}]},
     ],
 }
 
@@ -453,10 +456,61 @@ def test_pixel_stats_total_rollup_and_window(fake):
     assert int(params['end_time']) - int(params['start_time']) == 2 * 86400
 
 
+def test_pixel_stats_value_is_label_not_number(fake):
+    # Regression: `value` holds the event name, the number lives in `count`.
+    # The old code coerced 'PageView' to float, fell back to 0 and dropped
+    # the label, so every row read "count 0" with no event column.
+    out = text(call('meta_ads_get_pixel_stats', pixel_id='777',
+                    start_date='2026-04-14', end_date='2026-04-15'))
+    lines = out.splitlines()
+    assert '2026-04-14,PageView,90' in lines
+    assert '2026-04-14,Lead,8' in lines
+    assert not any(line.endswith(',0') for line in lines)
+
+
+def test_pixel_stats_dimensionless_aggregation_number_in_value(fake):
+    # Aggregations without a dimension (e.g. pixel_fire) return the number
+    # in `value` with no `count`; it must still sum as the count.
+    fake.overrides['/777/stats'] = {'data': [
+        {'start_time': '2026-04-14T03:00:00+0000', 'data': [{'value': 4}]},
+        {'start_time': '2026-04-14T09:00:00+0000', 'data': [{'value': 6}]},
+    ]}
+    out = text(call('meta_ads_get_pixel_stats', pixel_id='777',
+                    start_date='2026-04-14', end_date='2026-04-14',
+                    aggregation='pixel_fire'))
+    assert '2026-04-14,10' in out
+
+
+def test_pixel_stats_legacy_number_in_value_with_named_dim(fake):
+    # Older stats shape: the number in `value` next to a named dimension key.
+    fake.overrides['/777/stats'] = {'data': [
+        {'start_time': '2026-04-14T03:00:00+0000',
+         'data': [{'value': '5', 'event': 'Lead'}]},
+    ]}
+    out = text(call('meta_ads_get_pixel_stats', pixel_id='777',
+                    start_date='2026-04-14', end_date='2026-04-14'))
+    assert '2026-04-14,Lead,5' in out
+
+
 def test_custom_conversion_stats_rollup(fake):
     out = text(call('meta_ads_get_custom_conversion_stats', custom_conversion_id='501',
                     start_date='2026-04-14', end_date='2026-04-14'))
     assert '2026-04-14,10' in out  # 4 + 6 via the count key and timestamp field
+
+
+def test_custom_conversion_stats_dimensional_aggregation(fake):
+    # Dimensional aggregations pair value (label) with count, like pixel
+    # stats; the column must carry the aggregation name, not 'value'.
+    fake.overrides['/501/stats'] = {'data': [
+        {'timestamp': '2026-04-14T03:00:00+0000',
+         'data': [{'value': 'desktop', 'count': 7}, {'value': 'mobile', 'count': 2}]},
+    ]}
+    out = text(call('meta_ads_get_custom_conversion_stats', custom_conversion_id='501',
+                    start_date='2026-04-14', end_date='2026-04-14',
+                    aggregation='device_type'))
+    assert 'date,device_type,count' in out
+    assert '2026-04-14,desktop,7' in out
+    assert '2026-04-14,mobile,2' in out
 
 
 # ---------------------------------------------------------------- pixel health

@@ -785,8 +785,12 @@ def meta_ads_list_pixels(
 _STATS_ROW_META = ("start_time", "timestamp", "end_time", "value", "count", "data", "aggregation")
 
 
-def _roll_up_stats(raw_rows: List[Dict[str, Any]], bucket: str) -> List[Dict[str, Any]]:
+def _roll_up_stats(raw_rows: List[Dict[str, Any]], bucket: str,
+                   value_dim: str = "value") -> List[Dict[str, Any]]:
     """Aggregate Meta's hourly stat rows into day / total buckets."""
+    # Metric-style aggregation names would collide with the output columns.
+    if value_dim in ("count", "date", "hour"):
+        value_dim = "value"
     agg: Dict[Tuple[str, Tuple], float] = {}
     for row in raw_rows:
         ts = str(row.get("start_time") or row.get("timestamp") or "")
@@ -803,17 +807,27 @@ def _roll_up_stats(raw_rows: List[Dict[str, Any]], bucket: str) -> List[Dict[str
         if isinstance(entries, dict):
             entries = [entries]
         if not isinstance(entries, list) or not entries:
-            entries = [{"value": row.get("value", 0)}]
+            entries = [{k: row[k] for k in ("value", "count") if k in row}
+                       or {"count": 0}]
         for entry in entries:
             if not isinstance(entry, dict):
-                entry = {"value": entry}
-            raw_val = entry.get("value", entry.get("count", 0))
+                entry = {"count": entry}
+            # Meta pairs `value` (the dimension label, e.g. the event name)
+            # with `count` (the number); dimension-less aggregations return
+            # the number in `value` with no `count`.
+            if "count" in entry:
+                raw_val = entry.get("count")
+                num_keys = ("count",)
+            else:
+                raw_val = entry.get("value", 0)
+                num_keys = ("count", "value")
             try:
                 val = float(raw_val)
             except (TypeError, ValueError):
                 val = 0.0
             dims = tuple(sorted(row_dims + [
-                (k, str(v)) for k, v in entry.items() if k not in ("value", "count")
+                (value_dim if k == "value" else k, str(v))
+                for k, v in entry.items() if k not in num_keys
             ]))
             key = (label, dims)
             agg[key] = agg.get(key, 0.0) + val
@@ -870,7 +884,7 @@ def meta_ads_get_pixel_stats(
             pixel_id=pixel_id, start_time=start_ts, end_time=end_ts,
             aggregation=aggregation, event=event,
         )
-        rows = _roll_up_stats(response.get("data", []), bucket)
+        rows = _roll_up_stats(response.get("data", []), bucket, value_dim=aggregation)
         header = _kv({"pixel": pixel_id, "aggregation": aggregation,
                       "range": f"{start_date}..{end_date}", "bucket": bucket,
                       "rows": len(rows)})
@@ -1060,7 +1074,8 @@ def meta_ads_get_custom_conversion_stats(
             custom_conversion_id=custom_conversion_id,
             start_time=start_ts, end_time=end_ts, aggregation=aggregation,
         )
-        rows = _roll_up_stats(response.get("data", []), bucket)
+        rows = _roll_up_stats(response.get("data", []), bucket,
+                              value_dim=aggregation)
         header = _kv({"custom_conversion": custom_conversion_id,
                       "aggregation": aggregation,
                       "range": f"{start_date}..{end_date}", "bucket": bucket,
