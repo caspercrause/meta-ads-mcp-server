@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from zoneinfo import ZoneInfo
@@ -49,12 +50,18 @@ INSTRUCTIONS = """Meta (Facebook) Marketing API WRITE server - budget and end-da
 Every change is two-step: meta_ads_preview_changes returns a diff for the human to review
 plus a signed change_token per row (valid 15 minutes); meta_ads_apply_changes applies
 tokens only together with an approval_code typed by the human operator: a one-time code
-from their authenticator app (single-use, expires in about a minute), or the static write
-password on servers without TOTP. ALWAYS ask the human for a fresh code per batch; never
-guess one or reuse one from earlier context. Budgets are entered in ACCOUNT CURRENCY
-UNITS (515.50 means CHF 515.50 on a CHF account); the server converts to Meta's minor
-units itself and shows the raw api_value in the preview. end_date values are 'YYYY-MM-DD'
-or 'YYYY-MM-DD HH:MM' in the account timezone (defaults to 23:59). The server only
+from their authenticator app (single-use; a typed code stays valid for roughly 90
+seconds), or the static write password on servers without TOTP. ALWAYS ask the human for
+a fresh code per batch; never guess one or reuse one from earlier context. Budgets are
+entered in ACCOUNT CURRENCY UNITS (515.50 means CHF 515.50 on a CHF account); the server
+converts to Meta's minor units itself and shows the raw api_value in the preview.
+end_date values are 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' in the account timezone (defaults
+to 23:59). END DATES BELONG ON AD SETS: a campaign's stop_time is DERIVED from its ad
+sets' end_times, and when every ad set carries its own end date Meta silently ignores
+campaign-level writes, so the preview blocks them and lists the ad set ids to change
+instead. To extend a campaign, list its ad sets on the read MCP server and preview an
+end_date change per ad set; only target the campaign itself when its ad sets have no own
+end dates. The server only
 changes values that already exist (never daily<->lifetime switches, never adding a budget
 or a first end date), and blocks changes bigger than a configured factor or cap unless
 re-previewed with override=true. Apply re-reads every entity and refuses rows whose live
@@ -74,10 +81,20 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
+# The MCP plumbing (mcp.server.*) logs every request and session teardown at
+# INFO, burying the audit trail in deployment logs; keep the library at WARNING.
+logging.getLogger("mcp").setLevel(logging.WARNING)
+
 TOKEN_TTL_SECONDS = 900        # preview tokens die after 15 minutes
 MAX_CHANGES_PER_CALL = 50      # keeps every batch humanly reviewable
 HARD_CEILING_UNITS = 1_000_000  # absolute refusal, override or not
 AUTH_FAILURE_DELAY_SECONDS = 1.0  # slows brute-force guessing of codes/passwords
+# TOTP steps accepted around "now" (30s each). 2 keeps a typed code valid for
+# 60-90s after it appears on the phone: the human-in-the-loop round trip
+# (human types the code, the model composes the call, the client shows an
+# approval dialog) regularly outlives the 30-60s a 1-step window allows.
+# The single-use replay cache and the failure throttle keep this safe.
+TOTP_VALID_WINDOW = 2
 
 
 def _env_num(name: str, default: float, minimum: float) -> float:
@@ -408,17 +425,30 @@ def _preview_end_date(change: Change, entity: Dict[str, Any], currency: str,
                 entity.get('account_id', ''), campaign_id=str(entity['id']),
                 extra_fields=['end_time'],
             ).get('data', [])
-            own_ends = sorted(dt for a in adsets
-                              if (dt := _parse_meta_time(a.get('end_time'))))
+            own_ends = sorted(
+                ((str(a.get('id')), dt) for a in adsets
+                 if (dt := _parse_meta_time(a.get('end_time')))),
+                key=lambda pair: pair[1])
+            if own_ends and len(own_ends) == len(adsets):
+                # Verified live: in this shape Meta accepts the stop_time
+                # write with success:true and changes nothing, so redirect
+                # instead of letting an apply end in verify_failed.
+                shown = ' '.join(i for i, _ in own_ends[:10])
+                more = f" (+{len(own_ends) - 10} more)" if len(own_ends) > 10 else ''
+                row['result'] = (
+                    f"blocked: all {len(own_ends)} ad sets carry their own "
+                    f"end_time (earliest {own_ends[0][1].isoformat()[:16]}), so "
+                    "this campaign's stop_time is derived from them and Meta "
+                    "silently ignores direct writes to it. Change end_date on "
+                    f"the ad sets instead: {shown}{more}")
+                return None
             if own_ends:
                 warnings.append(
-                    f"{len(own_ends)} ad sets have their own end_time "
-                    f"(earliest {own_ends[0].isoformat()[:16]}); campaign "
-                    "stop_time does not move them, and Meta may even accept "
-                    "this write with success:true yet silently ignore it "
-                    "(apply reports verify_failed) - changing the ad sets' "
-                    "end_date is usually the effective lever")
-        except Exception as e:  # advisory only - never block the change itself
+                    f"{len(own_ends)} of {len(adsets)} ad sets have their own "
+                    f"end_time (earliest {own_ends[0][1].isoformat()[:16]}); "
+                    "campaign stop_time does not move those - change their "
+                    "end_date too if they should follow")
+        except Exception as e:  # advisory only - never block on a failed check
             warnings.append(f"could not check ad set end times: {_error_message(e)}")
 
     row['result'] = 'ready'
@@ -441,7 +471,10 @@ def meta_ads_preview_changes(
             field: 'daily_budget'|'lifetime_budget'|'end_date', new_value,
             override}. Budgets in ACCOUNT CURRENCY UNITS (515.5 = CHF
             515.50), never cents; end_date 'YYYY-MM-DD' or 'YYYY-MM-DD
-            HH:MM' in the account timezone (defaults to 23:59).
+            HH:MM' in the account timezone (defaults to 23:59). End-date
+            changes target the AD SETS: campaign stop_time is derived
+            from ad set end_times, so campaign-level attempts are
+            blocked with the ad set ids to use instead.
         format: 'compact' (CSV, default) or 'json'.
 
     Returns:
@@ -538,6 +571,9 @@ def meta_ads_preview_changes(
                     f"meta_ads_apply_changes with the change_token values and {ask}")
         else:
             note = None
+        logger.info("preview n=%d ready=%d blocked=%d no_change=%d accounts=%s",
+                    len(changes), counts['ready'], counts['blocked'],
+                    counts['no_change'], ','.join(sorted(accounts)) or '-')
         if format == "json":
             out: Dict[str, Any] = {**header}
             if note:
@@ -606,7 +642,7 @@ def _check_auth(approval_code: str) -> Optional[str]:
             try:
                 totp = pyotp.TOTP(secret)
                 usable += 1
-                if totp.verify(code, valid_window=1):
+                if totp.verify(code, valid_window=TOTP_VALID_WINDOW):
                     matched = name
                     break
             except Exception:
@@ -672,6 +708,12 @@ def meta_ads_apply_changes(
             raise ValueError(f"change_tokens is capped at {MAX_CHANGES_PER_CALL} per call")
         approver = _check_auth(approval_code)
         tokens = list(dict.fromkeys(change_tokens))
+        # One short id per approved batch: every log line of this call carries
+        # it, and it is echoed in the output header so a batch can be found in
+        # the deployment logs from the conversation (and vice versa).
+        batch_id = uuid.uuid4().hex[:8]
+        logger.info("apply batch=%s tokens=%d approved_by=%s",
+                    batch_id, len(tokens), approver or 'password')
 
         client = _get_client()
         rows: List[Dict[str, Any]] = []
@@ -722,11 +764,24 @@ def meta_ads_apply_changes(
                     if same(verify, new):
                         row['previous'], row['applied'] = _fmt(old), _fmt(new)
                         row['status'] = 'applied'
-                        logger.info("applied %s %s %s: %s -> %s approved_by=%s",
-                                    etype, eid, field, old, new, approver or 'password')
+                        if field == 'end_date':
+                            values = f"{old} -> {new}"
+                        else:
+                            values = (f"{currency} {_units_str(old, currency)} -> "
+                                      f"{_units_str(new, currency)} (raw {old} -> {new})")
+                        logger.info('applied %s %s "%s" act=%s %s: %s '
+                                    'approved_by=%s batch=%s',
+                                    etype, eid, entity.get('name') or '?',
+                                    entity.get('account_id') or '?', field, values,
+                                    approver or 'password', batch_id)
                     else:
                         row['status'] = 'verify_failed'
                         row['detail'] = f"post-write read returned {verify!r}, expected {new!r}"
+                        logger.warning('verify_failed %s %s "%s" act=%s %s: post-write '
+                                       'read %r, expected %r batch=%s',
+                                       etype, eid, entity.get('name') or '?',
+                                       entity.get('account_id') or '?', field,
+                                       verify, new, batch_id)
             except FacebookAPIError as e:
                 row['status'] = 'error'
                 row['detail'] = _error_message(e)
@@ -740,7 +795,10 @@ def meta_ads_apply_changes(
         note = ("some rows were not applied; re-run meta_ads_preview_changes for them"
                 if any(r['status'] not in ('applied', 'already_applied') for r in rows)
                 else None)
-        header: Dict[str, Any] = dict(counts)
+        logger.info("batch=%s done %s approved_by=%s", batch_id,
+                    ' '.join(f"{k}={v}" for k, v in sorted(counts.items())),
+                    approver or 'password')
+        header: Dict[str, Any] = {'batch': batch_id, **counts}
         if approver:
             header['approved_by'] = approver
         if format == "json":

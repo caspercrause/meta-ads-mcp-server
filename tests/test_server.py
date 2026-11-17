@@ -176,8 +176,8 @@ class FakeAPI:
             return ADSETS
         if endpoint.endswith('/ads'):
             return ADS
-        if endpoint == '/':
-            return {cid: CREATIVES[cid] for cid in params['ids'].split(',')}
+        if endpoint.lstrip('/') in CREATIVES:
+            return CREATIVES[endpoint.lstrip('/')]
         if endpoint.endswith('/insights'):
             return INSIGHTS
         if endpoint.endswith('/adspixels'):
@@ -324,8 +324,9 @@ def test_ads_include_copy_requests_text(fake):
 
 def test_creatives_batched_and_extracted(fake):
     out = text(call('meta_ads_get_creatives', creative_ids=['401', '402']))
-    assert fake.calls[0][0] == '/'
-    assert fake.calls[0][1]['ids'] == '401,402'
+    # One GET per id: the `?ids=` root batch form is deprecated in v26.0+.
+    assert [c[0] for c in fake.calls] == ['/401', '/402']
+    assert all('ids' not in c[1] for c in fake.calls)
     lines = out.splitlines()
     assert lines[0] == 'creatives=2'
     assert lines[1] == 'creative_id,element,text'
@@ -693,7 +694,7 @@ def test_creative_text_with_commas_newlines_separator(fake):
     import csv as csv_mod
     import io
     tricky = 'a,b\nc ¦ d'
-    fake.overrides['/'] = {'900': {'id': '900', 'body': tricky, 'title': 'T'}}
+    fake.overrides['/900'] = {'id': '900', 'body': tricky, 'title': 'T'}
     out = text(call('meta_ads_get_creatives', creative_ids=['900']))
     rows = list(csv_mod.reader(io.StringIO('\n'.join(out.splitlines()[1:]))))
     assert rows[0] == ['creative_id', 'element', 'text']

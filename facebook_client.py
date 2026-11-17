@@ -437,16 +437,16 @@ class FacebookAdsClient:
 
     def get_ad_creatives(self, creative_ids: Sequence[str]) -> Dict[str, Any]:
         """
-        Retrieve multiple AdCreative objects in one batched request.
+        Retrieve multiple AdCreative objects, keyed by creative id.
 
-        Uses the Graph API's `?ids=a,b,c` form, which returns a dict keyed
-        by creative id. Meta rejects the whole request if any id is invalid.
+        One GET per id: the Graph API's `?ids=a,b,c` batch form is
+        deprecated in v26.0+ (error 100 "The ids query parameter is
+        deprecated"). An invalid id still fails the whole call, matching
+        the old batch behaviour.
         """
-        params = {
-            'ids': ','.join(creative_ids),
-            'fields': 'body,title,object_story_spec,asset_feed_spec,image_url'
-        }
-        return self._make_request("/", params=params)
+        fields = 'body,title,object_story_spec,asset_feed_spec,image_url'
+        return {cid: self._make_request(f"/{cid}", params={'fields': fields})
+                for cid in creative_ids}
 
     # ------------------------------------------------------------------
     # Insights

@@ -472,7 +472,7 @@ def meta_ads_get_creatives(
     creative_ids: IdList,
     format: Format = "compact",
 ) -> str:
-    """Fetch ad copy for up to 50 creatives in one batched call.
+    """Fetch ad copy for up to 50 creatives in one call.
 
     Compact output is one row per text element (body, title, description,
     cta, link, per-slide carousel headlines, dynamic-creative variants).

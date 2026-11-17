@@ -7,7 +7,9 @@ optimistic locking (stale rows), and post-write verification.
 """
 import asyncio
 import copy
+import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -348,15 +350,21 @@ def test_preview_without_password_is_dry_run(fake, monkeypatch):
     assert rows[0]['change_token'] == ''
 
 
-def test_preview_earliest_adset_end_time_by_instant(fake):
-    """+0200 02:30 is an earlier instant than +0100 02:00; the warning must
-    pick the earliest by instant, not by lexicographic string order."""
+def test_preview_campaign_end_blocked_when_all_adsets_have_ends(fake):
+    """With EVERY ad set carrying its own end_time the campaign's stop_time
+    is derived and a direct write is a verified no-op, so the preview blocks
+    and redirects to the ad set ids. The earliest end is computed by instant,
+    not string order: +0200 02:30 is earlier than +0100 02:00."""
     fake.entities['911']['end_time'] = '2026-12-20T02:30:00+0200'
     fake.entities['913']['end_time'] = '2026-12-20T02:00:00+0100'
     out = preview({'entity_type': 'campaign', 'entity_id': '903',
                    'field': 'end_date', 'new_value': FUT2})
     _, rows = tokens_of(out)
-    assert 'earliest 2026-12-20T02:30' in rows[0]['warnings']
+    assert 'blocked=1' in out
+    result = rows[0]['result']
+    assert 'earliest 2026-12-20T02:30' in result
+    assert '911' in result and '913' in result    # redirect names the ad sets
+    assert rows[0]['change_token'] == ''
 
 
 def test_preview_advisory_adset_check_never_blocks(fake):
@@ -627,3 +635,74 @@ def test_apply_verification_reads_back(fake):
     fake.posts.clear()
     out = text(apply(list(toks.values())))
     assert 'applied=1' in out and len(fake.posts) == 1
+
+# ---------------------------------------------------------------- audit logs
+
+class _LogCapture(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def _capture():
+    handler = _LogCapture()
+    write_server.logger.addHandler(handler)
+    return handler
+
+
+def test_apply_logs_carry_audit_context(fake):
+    """Applied rows log entity name, account, human-readable values and a
+    batch id that the output header echoes, so a conversation and the
+    deployment logs can always be tied together."""
+    toks, _ = tokens_of(preview({'entity_type': 'campaign', 'entity_id': '901',
+                                 'field': 'lifetime_budget', 'new_value': 600}))
+    handler = _capture()
+    try:
+        out = text(apply(list(toks.values())))
+    finally:
+        write_server.logger.removeHandler(handler)
+    joined = '\n'.join(handler.lines)
+    assert '"CBO Lifetime"' in joined and 'act=42' in joined
+    assert 'CHF 515.00 -> 600.00 (raw 51500 -> 60000)' in joined
+    assert 'approved_by=password' in joined
+    batch_id = re.search(r'batch=([0-9a-f]{8})', out).group(1)
+    assert f'batch={batch_id}' in joined
+    assert any(line.startswith(f'batch={batch_id} done') for line in handler.lines)
+
+
+def test_preview_logs_summary_line(fake):
+    handler = _capture()
+    try:
+        preview({'entity_type': 'campaign', 'entity_id': '901',
+                 'field': 'lifetime_budget', 'new_value': 600})
+    finally:
+        write_server.logger.removeHandler(handler)
+    assert any(line.startswith('preview n=1 ready=1 blocked=0 no_change=0')
+               and 'accounts=42' in line for line in handler.lines)
+
+
+def test_mcp_library_loggers_quieted():
+    """The MCP plumbing must not bury the audit trail at INFO."""
+    assert logging.getLogger('mcp').level >= logging.WARNING
+
+
+# ---------------------------------------------------------------- totp window
+
+def test_totp_leeway_accepts_previous_step_code(fake, totp):
+    """A code stays valid ~60-90s after it appears: slow claude.ai round
+    trips (human types, model composes, client confirms) must not expire it."""
+    toks, _ = tokens_of(preview({'entity_type': 'campaign', 'entity_id': '902',
+                                 'field': 'daily_budget', 'new_value': 60}))
+    aged = pyotp.TOTP(totp).at(time.time() - 60)     # two 30s steps old
+    assert 'applied=1' in text(apply(list(toks.values()), approval=aged))
+
+
+def test_totp_rejects_three_step_old_code(fake, totp):
+    toks, _ = tokens_of(preview({'entity_type': 'campaign', 'entity_id': '902',
+                                 'field': 'daily_budget', 'new_value': 60}))
+    ancient = pyotp.TOTP(totp).at(time.time() - 90)  # three steps: too old
+    res = apply(list(toks.values()), approval=ancient)
+    assert res.is_error and 'invalid one-time code' in text(res)
