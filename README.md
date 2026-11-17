@@ -1,6 +1,9 @@
 # Meta Ads MCP Server
 
-A read-only Model Context Protocol (MCP) server for the Meta (Facebook) Marketing API, engineered for low token usage and unambiguous tool selection.
+Two Model Context Protocol (MCP) servers for the Meta (Facebook) Marketing API, engineered for low token usage and unambiguous tool selection:
+
+- **Read server** (`server.py`) - strictly read-only reporting and diagnostics. This is the server most users connect.
+- **Write server** (`write_server.py`) - a separately deployed server whose only capability is changing existing campaign or ad set budgets and end dates, behind a preview step, signed change tokens, and a write password known only to human operators. See [Write server](#write-server) below.
 
 ## Design Principles
 
@@ -87,10 +90,10 @@ cp .env.example .env
 Edit `.env`:
 
 ```bash
-FACEBOOK_ACCESS_TOKEN=your_long_lived_token_here
+FACEBOOK_ACCESS_TOKEN_R=your_read_token_here
 ```
 
-The access token is the only required configuration. `FACEBOOK_API_VERSION` exists as an optional override for emergency pins or rollbacks; when it is unset the code's tested default (v26.0) applies.
+The read token is the only configuration the read server requires (the legacy `FACEBOOK_ACCESS_TOKEN` name still works as a fallback). The write server instead requires `FACEBOOK_ACCESS_TOKEN_W`, the `ads_management` token of a dedicated write system user, with no fallback. `FACEBOOK_API_VERSION` exists as an optional override for emergency pins or rollbacks; when it is unset the code's tested default (v26.0) applies.
 
 Keep the `.env` file secure and never commit it to version control.
 
@@ -115,10 +118,10 @@ python server.py
 ```bash
 fastmcp login
 fastmcp deploy
-fastmcp env set FACEBOOK_ACCESS_TOKEN="your_token_here"
+fastmcp env set FACEBOOK_ACCESS_TOKEN_R="your_read_token_here"
 ```
 
-The token is the only secret the deployment needs.
+The read token is the only secret the read deployment needs.
 
 ## Example Calls
 
@@ -168,9 +171,50 @@ Caveats:
 - Links for policy-rejected ads stop working.
 - Anyone with the link can view the preview, so share unapproved ads deliberately.
 
+## Write server
+
+`write_server.py` is a second, independently deployed MCP server. Its scope is deliberately tiny: change an **existing** daily budget, lifetime budget, or end date on a campaign or ad set. It never creates entities, never changes statuses, never switches an entity between daily and lifetime budgeting, and never adds a budget where none exists.
+
+Every change is a two-step, human-in-the-loop flow:
+
+1. `meta_ads_preview_changes` (read-only) diffs each proposed change against the live entity and returns a signed `change_token` per acceptable row. Tokens expire after 15 minutes and are bound to the exact old and new values. The preview shows the raw API value that would be sent, so the unit conversion is always visible.
+2. A human reviews the diff and types their approval: a one-time code from their authenticator app when `META_WRITE_TOTP_SECRET` is configured (recommended; codes are single-use and expire within about a minute, so nothing durable ever sits in a conversation transcript), or the static `META_WRITE_PASSWORD` on servers without TOTP.
+3. `meta_ads_apply_changes` accepts tokens only together with a valid approval code. Each entity is re-read first, and a row is refused as `stale` when its live value changed after the preview. After writing, the entity is read once more to verify the result.
+
+Guardrails on top of the flow:
+
+- Budgets are entered in **account currency units** (`515.50` means CHF 515.50 on a CHF account). The server converts to Meta's minor-unit convention internally, including the eleven no-cent currencies (JPY, KRW, TWD, HUF, and others) where raw values are whole units.
+- Changes beyond a x5 factor of the current value, or above configurable caps, are blocked unless the preview is re-run with `override=true` after explicit human confirmation. A change that would set a budget to 1,000,000 currency units or more is refused outright, even with override. For the no-cent currencies (JPY, KRW, and the other offset-1 currencies), whose denominations run about 100x larger, every unit-denominated guard scales x100, making the hard ceiling 100,000,000 there.
+- Budget changes on the wrong entity are blocked with a pointer to the right one: ad sets under a campaign-budget (CBO) campaign redirect to the campaign, and campaigns whose budgets sit on their ad sets (ABO) redirect to the ad sets.
+- End dates are entered as `YYYY-MM-DD` (or `YYYY-MM-DD HH:MM`) in the account timezone and sent as ISO 8601 with an explicit UTC offset. Past dates are refused, lifetime-budget re-pacing is warned about, and changing a campaign's `stop_time` warns when its ad sets carry their own `end_time` values.
+- Batches are capped at 50 changes so every batch stays reviewable, and apply rows are independent: one failure never blocks the rest.
+
+### Operator enrollment
+
+`totp_enroll.py` produces the authenticator QR codes. Run it locally in a plain terminal, never inside an AI conversation, because the QR visually encodes the secret. Operators never need Python themselves; the administrator runs the commands and operators scan the QR off the administrator's screen.
+
+| Goal | Command |
+|------|---------|
+| Enroll a NEW operator (fresh secret) | `python totp_enroll.py --name alice` |
+| Re-render an existing secret (replacement phone, second phone) | `python totp_enroll.py --name alice --secret BASE32...` |
+| Re-render the secret stored in the local `.env` | `python totp_enroll.py --from-env` |
+
+`--name` only sets the label shown in the authenticator app. The secret is reused whenever `--secret` or `--from-env` is given, and freshly generated only when both are absent, so every phone that scans a `--from-env` QR shares one identical secret.
+
+Server-side configuration accepts both forms, together or alone:
+
+- `META_WRITE_TOTP_SECRET=BASE32...` - one shared secret; every approval logs as `approved_by=operator`.
+- `META_WRITE_TOTP_SECRETS=alice:BASE32ONE,bob:BASE32TWO` - per-operator pairs. On each approval attempt the server tries the submitted code against every configured secret; the first match identifies the operator, whose name is recorded in the tool output and the server log as `approved_by=<name>`.
+
+Codes are single-use (a replay cache refuses a code that already approved a batch, per operator) and failed attempts are logged and throttled by one second. Onboarding is appending `,name:SECRET` to the list and offboarding is deleting that entry; locally the change applies on the next call since the env is read per request, while a deployed service needs a restart to pick up new env values. Secrets travel between people only via a password manager, never chat or email, since holding a secret means holding approval power.
+
+**Trade-offs of the shared-secret form:** no per-person attribution, revocation is all-or-nothing, and because all phones show the same code simultaneously, two operators approving within the same roughly 90-second window collide (the second is refused as already used). Per-operator pairs avoid all three.
+
+Deploy it as its own service with `write_server.py` as the entrypoint and two secrets: `FACEBOOK_ACCESS_TOKEN_W` (the write system user's `ads_management` token; only the ad accounts assigned to that system user can ever be changed) plus `META_WRITE_TOTP_SECRET` (recommended) or `META_WRITE_PASSWORD`. Generate the TOTP secret outside any AI conversation (`python -c "import pyotp; print(pyotp.random_base32())"`) and enter the same value in the operator's authenticator app. Without a configured approval secret, applying is disabled and previews become dry runs.
+
 ## Troubleshooting
 
-**Token errors (code 190):** Long-lived tokens expire after about 60 days. Regenerate `FACEBOOK_ACCESS_TOKEN`.
+**Token errors (code 190):** Long-lived tokens expire after about 60 days. Regenerate the affected token (`FACEBOOK_ACCESS_TOKEN_R` or `FACEBOOK_ACCESS_TOKEN_W`).
 
 **Empty results:** Status filters default to `ACTIVE`. Pass `status='ALL'` to see paused and archived entities. Verify the account id with `meta_ads_list_accounts`.
 

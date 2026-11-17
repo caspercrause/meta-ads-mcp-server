@@ -16,7 +16,9 @@ import time
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+# Anchor .env to this repo so stdio MCP launches work from any CWD; real
+# environment variables always take precedence (deployments set those).
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 # Safety guard on cursor pagination: 50 pages x limit 100 = 5000 entities.
 MAX_PAGES = 50
@@ -109,14 +111,21 @@ class FacebookAdsClient:
         self,
         access_token: Optional[str] = None,
         api_version: Optional[str] = None,
+        token_env_vars: Sequence[str] = ('FACEBOOK_ACCESS_TOKEN',),
     ) -> None:
         """
         Initialize the client.
 
         Args:
-            access_token: Meta access token (defaults to FACEBOOK_ACCESS_TOKEN env var)
-            api_version: Graph API version (defaults to FACEBOOK_API_VERSION env var,
-                falling back to v26.0)
+            access_token: Meta access token. When omitted, the env vars in
+                token_env_vars are tried in order; the read server passes
+                ('FACEBOOK_ACCESS_TOKEN_R', 'FACEBOOK_ACCESS_TOKEN') and the
+                write server passes ('FACEBOOK_ACCESS_TOKEN_W',) with no
+                fallback, so a write deployment can never silently run on a
+                read-scoped token.
+            api_version: Graph API version (defaults to FACEBOOK_API_VERSION
+                env var, falling back to v26.0)
+            token_env_vars: Env var names to try, in order.
 
         Raises:
             ValueError: If no access token is provided or found in environment
@@ -124,28 +133,41 @@ class FacebookAdsClient:
         self.api_version = api_version or os.getenv('FACEBOOK_API_VERSION', 'v26.0')
         self.base_url = f"https://graph.facebook.com/{self.api_version}"
 
-        self._access_token = access_token or os.getenv('FACEBOOK_ACCESS_TOKEN')
+        self._access_token = access_token
+        if not self._access_token:
+            for name in token_env_vars:
+                self._access_token = os.getenv(name)
+                if self._access_token:
+                    break
         if not self._access_token:
             raise ValueError(
                 "Facebook access token must be provided via parameter or "
-                "FACEBOOK_ACCESS_TOKEN environment variable"
+                f"one of these environment variables: {', '.join(token_env_vars)}"
             )
 
     def _make_request(
         self,
         endpoint: str,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        method: str = 'GET',
+        data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Make an authenticated GET request with retry on transient failures.
+        Make an authenticated request with retry on transient failures.
 
         Retries on network errors, HTTP 429, HTTP 5xx, and Meta's transient
         error codes (RETRYABLE_CODES), waiting RETRY_WAITS seconds between
-        attempts. Non-transient API errors raise immediately.
+        attempts. Non-transient API errors raise immediately. POST is used
+        only by the write server, which sends absolute values (a budget
+        amount, an end time), so a retried POST after a timeout re-applies
+        the same state and stays idempotent. For POST the access token is
+        placed in the form body, not the URL.
 
         Args:
             endpoint: API endpoint path (e.g., "/me/adaccounts")
             params: Query parameters for the request
+            method: 'GET' (default) or 'POST'
+            data: Form fields for a POST
 
         Returns:
             JSON response as dictionary
@@ -155,14 +177,23 @@ class FacebookAdsClient:
         """
         url = f"{self.base_url}{endpoint}"
         request_params = dict(params or {})
-        request_params['access_token'] = self._access_token
+        post_data: Optional[Dict[str, Any]] = None
+        if method == 'POST':
+            post_data = dict(data or {})
+            post_data['access_token'] = self._access_token
+        else:
+            request_params['access_token'] = self._access_token
 
         last_error: Optional[FacebookAPIError] = None
         for attempt in range(len(RETRY_WAITS) + 1):
             if attempt:
                 time.sleep(RETRY_WAITS[attempt - 1])
             try:
-                response = requests.get(url, params=request_params, timeout=30)
+                if method == 'POST':
+                    response = requests.post(url, params=request_params,
+                                             data=post_data, timeout=30)
+                else:
+                    response = requests.get(url, params=request_params, timeout=30)
             except requests.exceptions.RequestException as e:
                 # requests embeds the full URL (including the access_token
                 # query param) in its exception text, so redact before the
@@ -560,6 +591,24 @@ class FacebookAdsClient:
             'limit': limit
         }
         return self._make_paginated_request(f"/{custom_conversion_id}/stats", params=params)
+
+    # ------------------------------------------------------------------
+    # Single-object reads and updates (used by the write server)
+    # ------------------------------------------------------------------
+
+    def get_object(self, object_id: str, fields: Sequence[str]) -> Dict[str, Any]:
+        """Retrieve one Graph object (campaign, ad set, ad account) by id."""
+        return self._make_request(f"/{object_id}", params={'fields': ','.join(fields)})
+
+    def update_object(self, object_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        POST field updates to one Graph object.
+
+        Only absolute values are ever sent (a budget amount in minor units,
+        an ISO-8601 end time), so a retried request after a timeout
+        re-applies the same state rather than compounding a change.
+        """
+        return self._make_request(f"/{object_id}", method='POST', data=data)
 
     @staticmethod
     def _normalize_account_id(account_id: str) -> str:

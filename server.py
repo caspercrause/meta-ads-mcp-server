@@ -11,18 +11,16 @@ lines, default) or format='json' (minified, null fields stripped).
 
 Transport: stdio.
 """
-import csv
-import io
-import json
 from datetime import datetime
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
-from pydantic import BeforeValidator
 
-from facebook_client import FacebookAdsClient, FacebookAPIError, _date_to_unix
+from facebook_client import FacebookAdsClient, _date_to_unix
 from data_processor import FacebookDataProcessor
+from rendering import (SEP, Format, Id, IdList, _csv, _error_message, _json,
+                       _kv, _lines)
 
 INSTRUCTIONS = """Read-only Meta (Facebook) Marketing API.
 ids: account_id comes from meta_ads_list_accounts; the act_ prefix is optional everywhere.
@@ -32,7 +30,10 @@ In compact output, lists are joined with ' ¦ '. status columns show Meta's effe
 name_contains is a CASE-SENSITIVE server-side substring match (the only name operator Meta
 supports); anchor the substring for prefix-style matching. Budgets and spend are in the
 account currency; budget columns are converted from cents. Pagination is internal and results
-are complete unless a 'truncated:' line says otherwise."""
+are complete unless a 'truncated:' line says otherwise.
+Routing: every performance / results / spend question is answered by meta_ads_get_insights
+with the matching level ('campaign', 'adset', 'ad'); the list_* tools return settings only
+and contain no performance data."""
 
 mcp = FastMCP("meta_ads_mcp", instructions=INSTRUCTIONS, include_fastmcp_meta=False)
 
@@ -43,7 +44,6 @@ READONLY = {
     "openWorldHint": True,
 }
 
-Format = Literal["compact", "json"]
 Level = Literal["account", "campaign", "adset", "ad"]
 Status = Literal["ACTIVE", "PAUSED", "ARCHIVED", "WITH_ISSUES", "ALL"]
 AdsetStatus = Literal["ACTIVE", "PAUSED", "CAMPAIGN_PAUSED", "ARCHIVED", "WITH_ISSUES", "ALL"]
@@ -52,14 +52,6 @@ AdStatus = Literal["ACTIVE", "PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED", "ARCHI
 Increment = Literal["total", "day", "week", "month"]
 Bucket = Literal["hour", "day", "total"]
 
-# Ids are strings in the Graph API, but clients often send them as JSON numbers.
-Id = Annotated[str, BeforeValidator(
-    lambda v: str(v) if isinstance(v, int) and not isinstance(v, bool) else v)]
-# Id-list filters also arrive as a bare scalar now and then.
-IdList = Annotated[List[Id], BeforeValidator(
-    lambda v: [v] if isinstance(v, (str, int)) and not isinstance(v, bool) else v)]
-
-SEP = " ¦ "
 MAX_INSIGHTS_ROWS = 1000
 MAX_LIST_ROWS = 500
 MAX_CREATIVE_IDS = 50
@@ -85,34 +77,9 @@ _processor = FacebookDataProcessor()
 def _get_client() -> FacebookAdsClient:
     global _client
     if _client is None:
-        _client = FacebookAdsClient()
+        _client = FacebookAdsClient(
+            token_env_vars=('FACEBOOK_ACCESS_TOKEN_R', 'FACEBOOK_ACCESS_TOKEN'))
     return _client
-
-
-def _error_message(e: Exception) -> str:
-    if isinstance(e, FacebookAPIError):
-        code = e.code
-        if code == 190:
-            return (f"Meta access token invalid or expired (code 190): {e.message} "
-                    "Regenerate FACEBOOK_ACCESS_TOKEN.")
-        if code in (4, 17, 613, 80004):
-            return (f"Meta rate limit (code {code}) persisted after retries: {e.message} "
-                    "Wait a few minutes before retrying.")
-        if code == 100:
-            return (f"Meta rejected the request (code 100): {e.message} "
-                    "Common causes: invalid field name, unsupported filter operator "
-                    "(name supports only CONTAIN; objective only IN), or a malformed parameter.")
-        if code in (10, 200, 294):
-            return (f"Permission denied (code {code}): {e.message} "
-                    "The token lacks a required permission (ads_read; "
-                    "business_management for dataset quality).")
-        if code == 803:
-            return (f"Unknown or inaccessible object id (code 803): {e.message} "
-                    "Verify ids with the list tools.")
-        if code:
-            return f"Meta API error {code}: {e.message}"
-        return f"Meta API request failed: {e.message}"
-    return str(e)
 
 
 def _parse_date(value: str, field_name: str) -> datetime:
@@ -130,61 +97,6 @@ def _validate_range(start_date: str, end_date: str) -> None:
 
 
 # ============================================================ rendering
-
-def _strip(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: _strip(v) for k, v in obj.items() if v is not None}
-    if isinstance(obj, list):
-        return [_strip(v) for v in obj]
-    return obj
-
-
-def _json(data: Any) -> str:
-    return json.dumps(_strip(data), separators=(",", ":"), default=str, ensure_ascii=False)
-
-
-def _cell(v: Any) -> Any:
-    if v is None:
-        return ""
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, list):
-        return SEP.join(
-            json.dumps(x, separators=(",", ":"), ensure_ascii=False)
-            if isinstance(x, (dict, list)) else str(x)
-            for x in v
-        )
-    if isinstance(v, dict):
-        return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
-    return v
-
-
-def _csv(rows: List[Dict[str, Any]], keep: Optional[List[str]] = None) -> str:
-    """CSV of rows. Columns empty in every row are dropped unless listed in keep."""
-    cols: List[str] = list(keep or [])
-    for r in rows:
-        for k, v in r.items():
-            if k not in cols and v not in (None, [], ""):
-                cols.append(k)
-    if keep is None:
-        cols = [c for c in cols if any(r.get(c) not in (None, [], "") for r in rows)]
-    if not cols:
-        return ""
-    buf = io.StringIO()
-    w = csv.writer(buf, lineterminator="\n")
-    w.writerow(cols)
-    for r in rows:
-        w.writerow([_cell(r.get(c)) for c in cols])
-    return buf.getvalue().rstrip("\n")
-
-
-def _lines(*parts: Optional[str]) -> str:
-    return "\n".join(p for p in parts if p)
-
-
-def _kv(d: Dict[str, Any]) -> str:
-    return " ".join(f"{k}={_cell(v)}" for k, v in d.items() if v is not None)
-
 
 def _day(ts: Any) -> Any:
     return ts[:10] if isinstance(ts, str) else ts
@@ -286,7 +198,7 @@ def meta_ads_list_accounts(
 
 
 @mcp.tool(name="meta_ads_list_campaigns",
-          annotations={"title": "List Meta Campaigns", **READONLY}, output_schema=None)
+          annotations={"title": "List Meta Campaigns (settings, no metrics)", **READONLY}, output_schema=None)
 def meta_ads_list_campaigns(
     account_id: Id,
     status: Status = "ACTIVE",
@@ -298,9 +210,12 @@ def meta_ads_list_campaigns(
     extra_filters: Optional[List[dict]] = None,
     format: Format = "compact",
 ) -> str:
-    """List campaigns in a Meta ad account with server-side filtering.
+    """List campaign settings (ids, names, budgets, dates) - contains NO metrics.
 
-    For campaign performance use meta_ads_get_insights with level='campaign'.
+    Any campaign performance question (results, spend, conversions, ROAS,
+    CPA, clicks) is answered by meta_ads_get_insights with level='campaign',
+    never by this tool. Use it to discover campaigns, read budgets and
+    status, or collect campaign_ids for insights filters.
 
     Args:
         account_id: Ad account id ('act_' prefix optional).
@@ -355,7 +270,7 @@ _ADSET_BASE_KEYS = ("id", "name", "campaign_id", "effective_status", "daily_budg
 
 
 @mcp.tool(name="meta_ads_list_adsets",
-          annotations={"title": "List Meta Ad Sets", **READONLY}, output_schema=None)
+          annotations={"title": "List Meta Ad Sets (settings, no metrics)", **READONLY}, output_schema=None)
 def meta_ads_list_adsets(
     account_id: Id,
     campaign_id: Optional[Id] = None,
@@ -368,8 +283,10 @@ def meta_ads_list_adsets(
     extra_filters: Optional[List[dict]] = None,
     format: Format = "compact",
 ) -> str:
-    """List ad sets in an account or one campaign.
+    """List ad set settings (budgets, optimization setup) - contains NO metrics.
 
+    Ad set performance (results, spend, conversions) comes from
+    meta_ads_get_insights with level='adset', never from this tool.
     The promoted_object is flattened into pixel_id / custom_event_type /
     custom_event_str / custom_conversion_id / page_id columns, which shows
     what each ad set optimizes on (the pixel QA workhorse).
@@ -437,7 +354,7 @@ def meta_ads_list_adsets(
 
 
 @mcp.tool(name="meta_ads_list_ads",
-          annotations={"title": "List Meta Ads", **READONLY}, output_schema=None)
+          annotations={"title": "List Meta Ads (settings, no metrics)", **READONLY}, output_schema=None)
 def meta_ads_list_ads(
     account_id: Id,
     campaign_id: Optional[Id] = None,
@@ -451,8 +368,10 @@ def meta_ads_list_ads(
     extra_filters: Optional[List[dict]] = None,
     format: Format = "compact",
 ) -> str:
-    """List ads in an account, campaign, or ad set.
+    """List ad settings and preview links - contains NO metrics.
 
+    Ad performance (results, spend, conversions) comes from
+    meta_ads_get_insights with level='ad', never from this tool.
     preview_link is a public fb.me URL that renders the full ad (carousel
     slides included) without login - ideal for sharing with clients. For the
     complete ad copy use meta_ads_get_creatives with the creative_id values.
@@ -622,7 +541,7 @@ def _insights_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 @mcp.tool(name="meta_ads_get_insights",
-          annotations={"title": "Get Meta Ads Insights", **READONLY}, output_schema=None)
+          annotations={"title": "Meta Ads Performance (account/campaign/adset/ad)", **READONLY}, output_schema=None)
 def meta_ads_get_insights(
     account_id: Id,
     start_date: str,
@@ -638,11 +557,13 @@ def meta_ads_get_insights(
     attribution_windows: Optional[List[str]] = None,
     format: Format = "compact",
 ) -> str:
-    """Performance reporting at any level - the single reporting tool.
+    """THE performance tool - results for the account, campaigns, ad sets or ads.
 
-    level='campaign' returns one row per campaign ('adset' / 'ad' likewise);
-    id and name columns for the chosen level are added automatically, so
-    there is no separate campaign or adset performance tool to look for.
+    Every performance question (results, spend, conversions, ROAS, CPA,
+    clicks, reach) at any level is answered here: level='campaign' IS the
+    campaign performance report (one row per campaign; 'adset' / 'ad'
+    likewise, with id and name columns added automatically). The list_*
+    tools hold settings only and never answer performance questions.
 
     Args:
         account_id: Ad account id ('act_' prefix optional).
