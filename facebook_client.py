@@ -214,6 +214,15 @@ class FacebookAdsClient:
                 code = detail.get('code')
                 subcode = detail.get('error_subcode')
                 message = detail.get('message', message)
+                # error_user_title/_msg carry Meta's actionable explanation
+                # (e.g. 'Budget too low: Your budget must be at least
+                # CHF 189.70...'), which generic messages like 'Invalid
+                # parameter' hide. Surface them - operators need the number.
+                user_bits = ": ".join(
+                    s for s in (detail.get('error_user_title'),
+                                detail.get('error_user_msg')) if s)
+                if user_bits:
+                    message = f"{message} - {user_bits}"
             except ValueError:
                 pass
 

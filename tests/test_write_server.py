@@ -177,6 +177,27 @@ def test_write_client_requires_w_token(monkeypatch):
         FacebookAdsClient(token_env_vars=('FACEBOOK_ACCESS_TOKEN_W',))
 
 
+def test_api_error_surfaces_meta_user_message(monkeypatch):
+    """Meta's error_user_title/_msg (e.g. the exact minimum budget) must
+    reach the operator instead of a bare 'Invalid parameter'."""
+    class FakeResp:
+        ok = False
+        status_code = 400
+        text = 'x'
+        def json(self):
+            return {'error': {'message': 'Invalid parameter', 'code': 100,
+                              'error_subcode': 1885650,
+                              'error_user_title': 'Budget too low',
+                              'error_user_msg': 'Your budget must be at least CHF189.70.'}}
+    monkeypatch.setattr('facebook_client.requests.post', lambda *a, **k: FakeResp())
+    c = FacebookAdsClient(access_token='t')
+    with pytest.raises(FacebookAPIError) as ei:
+        c.update_object('123', {'lifetime_budget': '10100'})
+    assert 'Budget too low' in ei.value.message
+    assert 'CHF189.70' in ei.value.message
+    assert ei.value.code == 100
+
+
 def test_env_num_validation(monkeypatch):
     assert write_server._env_num('X_UNSET_VAR', 5.0, 1.0) == 5.0
     for junk in ('0', '-3', 'abc', 'inf'):
