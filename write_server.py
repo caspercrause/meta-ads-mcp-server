@@ -789,6 +789,10 @@ def meta_ads_apply_changes(
                 row['status'] = 'error'
                 row['detail'] = f"unexpected error: {e}"
 
+            if row['status'] == 'error':
+                logger.warning("error %s %s %s: %s batch=%s",
+                               row.get('entity'), row.get('id'),
+                               row.get('field'), row.get('detail'), batch_id)
             counts[row['status']] = counts.get(row['status'], 0) + 1
             rows.append(row)
 

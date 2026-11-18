@@ -706,3 +706,19 @@ def test_totp_rejects_three_step_old_code(fake, totp):
     ancient = pyotp.TOTP(totp).at(time.time() - 90)  # three steps: too old
     res = apply(list(toks.values()), approval=ancient)
     assert res.is_error and 'invalid one-time code' in text(res)
+
+
+def test_apply_error_rows_are_logged(fake):
+    """A row that fails against Meta must reach the audit trail with its
+    reason, not just bump the error count in the output."""
+    toks, _ = tokens_of(preview({'entity_type': 'campaign', 'entity_id': '902',
+                                 'field': 'daily_budget', 'new_value': 60}))
+    fake.fail_post = FacebookAPIError('Budget too low', code=100)
+    handler = _capture()
+    try:
+        out = text(apply(list(toks.values())))
+    finally:
+        write_server.logger.removeHandler(handler)
+    assert 'error=1' in out
+    assert any(line.startswith('error campaign 902 daily_budget:')
+               and 'batch=' in line for line in handler.lines)
